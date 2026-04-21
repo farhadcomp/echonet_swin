@@ -17,7 +17,7 @@ export NCCL_DEBUG=WARN
 
 # Output directory specifically for the Physiology-Informed Swin run
 OUTPUT_DIR="output/video/swin3d_physics_loss_weighted_decay"
-DATA_DIR="/home/AD.UNLV.EDU/farhadik/echo"
+DATA_DIR="/home/AD.UNLV.EDU/farhadik/echo_new/EchoNet-Dynamic"
 
 mkdir -p ${OUTPUT_DIR}
 TRAIN_LOG="${OUTPUT_DIR}/training_terminal_output.txt"

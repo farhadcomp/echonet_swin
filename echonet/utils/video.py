@@ -377,7 +377,7 @@ def run(
         bestLoss = float("inf")
         try:
             # Attempt to load checkpoint
-            checkpoint = torch.load(os.path.join(output, "checkpoint.pt"), map_location="cpu")
+            checkpoint = torch.load(os.path.join(output, "checkpoint.pt"), map_location="cpu", weights_only=False)
             model.load_state_dict(checkpoint['state_dict'])
             optim.load_state_dict(checkpoint['opt_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_dict'])
@@ -536,7 +536,7 @@ def run(
         # Load best weights
         if num_epochs != 0:
             # checkpoint = torch.load(os.path.join(output, "best.pt"))
-            checkpoint = torch.load(os.path.join(output, "best.pt"), map_location="cpu")
+            checkpoint = torch.load(os.path.join(output, "best.pt"), map_location="cpu", weights_only=False)
             model.load_state_dict(checkpoint['state_dict'])
             f.write("Best validation loss {} from epoch {}\n".format(checkpoint["loss"], checkpoint["epoch"]))
             f.flush()

@@ -18,5 +18,5 @@ def resize_tensors(input_dir, output_dir, size=(224, 224)):
         # Save back to disk
         torch.save(t_resized.byte(), os.path.join(output_dir, fname))
 
-resize_tensors("/home/AD.UNLV.EDU/farhadik/echo/Tensors", "/home/AD.UNLV.EDU/farhadik/echo/Tensors_224")
+resize_tensors("/home/AD.UNLV.EDU/farhadik/echo_new/EchoNet-Dynamic/Tensors", "/home/AD.UNLV.EDU/farhadik/echo_new/EchoNet-Dynamic/Tensors_224")
 
