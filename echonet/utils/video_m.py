@@ -1,4 +1,4 @@
-"""Functions for training and running EF prediction (swin3d)."""
+"""Functions for training and running Volume (EDV/ESV) prediction (Swin3d)."""
 
 import math
 import os
@@ -62,7 +62,7 @@ def run(
     seed=0,
     beta=1.0,
 ):
-    """Trains/tests EF prediction model."""
+    """Trains/tests Volume (EDV/ESV) prediction model."""
 
     # Seed RNGs
     np.random.seed(seed)
@@ -76,29 +76,31 @@ def run(
     # --------------------------
 
     if output is None:
-        output = os.path.join("output", "video", "{}_{}_{}_{}".format(model_name, frames, period, "pretrained" if pretrained else "random"))
+        output = os.path.join("output", "video", "volumes_{}_{}_{}_{}".format(model_name, frames, period, "pretrained" if pretrained else "random"))
     os.makedirs(output, exist_ok=True)
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Set up model dynamically
+    # Set up multi-output model dynamically
     if model_name == "swin3d_s":
         if local_rank == 0:
-            print("Initializing Custom Swin3D-S Architecture (Baseline EF)...")
+            print("Initializing Custom Swin3D-S Architecture (Volumes: EDV/ESV)...")
         model = torchvision.models.video.swin3d_s(weights='KINETICS400_V1')
         model.head = torch.nn.Sequential(
             torch.nn.Dropout(p=0.5),
-            torch.nn.Linear(model.head.in_features, 1)
+            torch.nn.Linear(model.head.in_features, 2)
         )
-        model.head[1].bias.data[0] = 55.6   # Average Ejection Fraction (%)
+        model.head[1].bias.data[0] = 120.0   # Average EDV (mL)
+        model.head[1].bias.data[1] = 50.0    # Average ESV (mL)
         
     else:
         if local_rank == 0:
-            print(f"Initializing Baseline {model_name} Architecture (Baseline EF)...")
+            print(f"Initializing Baseline {model_name} Architecture (Volumes: EDV/ESV)...")
         model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
-        model.fc = torch.nn.Linear(model.fc.in_features, 1)
-        model.fc.bias.data[0] = 55.6   # Average EF
+        model.fc = torch.nn.Linear(model.fc.in_features, 2)
+        model.fc.bias.data[0] = 120.0   # Average EDV
+        model.fc.bias.data[1] = 50.0    # Average ESV
 
     model.to(device)
 
@@ -134,15 +136,14 @@ def run(
     from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
     warmup_epochs = 5
     scheduler_warmup = LinearLR(optim, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-    # scheduler_cosine = CosineAnnealingLR(optim, T_max=(num_epochs - warmup_epochs))
-    scheduler_cosine = CosineAnnealingLR(optim, T_max=max(1, num_epochs - warmup_epochs))
+    scheduler_cosine = CosineAnnealingLR(optim, T_max=(num_epochs - warmup_epochs))
     scheduler = SequentialLR(optim, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_epochs])
 
     # Compute mean and std
     mean, std = echonet.utils.get_mean_and_std(echonet.datasets.Echo(root=data_dir, split="train"))
     
-    # Baseline EF Only Kwargs
-    kwargs = {"target_type": "EF",
+    # 🚨 CHANGED: Target Type is now a List for Multi-Output Regression
+    kwargs = {"target_type": ["EDV", "ESV"],
               "mean": mean,
               "std": std,
               "length": frames,
@@ -181,7 +182,7 @@ def run(
 
         for epoch in range(epoch_resume, num_epochs):
             if local_rank == 0:
-                print(f"Epoch #{epoch} | Baseline EF Only", flush=True)
+                print(f"Epoch #{epoch} | Volume Regression (EDV + ESV)", flush=True)
                 
             for phase in ['train', 'val']:
                 start_time = time.time()
@@ -271,7 +272,6 @@ def run(
                     echonet.datasets.Echo(root=data_dir, split=split, **kwargs),
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
                 
-                # CHANGED: Use model.module to bypass DDP expectations on a single GPU
                 loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, beta=beta)
                 
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
@@ -284,82 +284,137 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 
-                # CHANGED: Use model.module here too
                 loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size, beta=beta)
                 
-                f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
-                f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
-                f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))
+                # 🚨 CHANGED: Added axis=0 so EDV and ESV are averaged separately
+                f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(axis=0), yhat))), sklearn.metrics.r2_score)))
+                f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(axis=0), yhat))), sklearn.metrics.mean_absolute_error)))
+                f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(axis=0), yhat))), sklearn.metrics.mean_squared_error)))))
                 f.flush()
 
+                # Save 2D outputs (EDV, ESV) to CSV
                 with open(os.path.join(output, "{}_predictions.csv".format(split)), "w") as g:
                     for (filename, pred) in zip(ds.fnames, yhat):
                         for (i, p) in enumerate(pred):
-                            g.write("{},{},{:.4f}\n".format(filename, i, p))
+                            # p is now a list [EDV, ESV]
+                            g.write("{},{},{:.4f},{:.4f}\n".format(filename, i, p[0], p[1]))
+                
                 echonet.utils.latexify()
-                yhat = np.array(list(map(lambda x: x.mean(), yhat)))
+                yhat = np.array(list(map(lambda x: x.mean(axis=0), yhat)))
 
+                # Dynamic Scatter Plot (Automatically scales axes to accommodate 250+ mL volumes)
                 fig = plt.figure(figsize=(3, 3))
                 lower = min(y.min(), yhat.min())
                 upper = max(y.max(), yhat.max())
-                plt.scatter(y, yhat, color="k", s=1, edgecolor=None, zorder=2)
-                plt.plot([0, 100], [0, 100], linewidth=1, zorder=3)
-                plt.axis([lower - 3, upper + 3, lower - 3, upper + 3])
+                plt.scatter(y[:, 0], yhat[:, 0], color="b", s=1, edgecolor=None, zorder=2, label="EDV")
+                plt.scatter(y[:, 1], yhat[:, 1], color="r", s=1, edgecolor=None, zorder=2, label="ESV")
+                plt.plot([lower, upper], [lower, upper], linewidth=1, zorder=3, color="k")
+                plt.axis([lower - 10, upper + 10, lower - 10, upper + 10])
                 plt.gca().set_aspect("equal", "box")
-                plt.xlabel("Actual EF (%)")
-                plt.ylabel("Predicted EF (%)")
-                plt.xticks([10, 20, 30, 40, 50, 60, 70, 80])
-                plt.yticks([10, 20, 30, 40, 50, 60, 70, 80])
-                plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
-
-                # --- 🚨 ADD R2 TEXT BOX HERE 🚨 ---
-                r2_val = sklearn.metrics.r2_score(y, yhat)
-                plt.text(0.05, 0.95, f"$R^2$ = {r2_val:.3f}", 
+                plt.xlabel("Actual Volume (mL)")
+                plt.ylabel("Predicted Volume (mL)")
+                # --- 🚨 ADD R2 TEXT BOX TO VOLUME PLOT 🚨 ---
+                r2_edv = sklearn.metrics.r2_score(y[:, 0], yhat[:, 0])
+                r2_esv = sklearn.metrics.r2_score(y[:, 1], yhat[:, 1])
+                textstr = f"EDV $R^2$ = {r2_edv:.3f}\nESV $R^2$ = {r2_esv:.3f}"
+                
+                # Pins a white text box to the top-left corner
+                plt.text(0.05, 0.95, textstr, 
                          transform=plt.gca().transAxes, fontsize=9, 
                          verticalalignment='top', 
                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), zorder=4)
-                # ----------------------------------
-
+                # --------------------------------------------
+                
+                plt.legend(loc="lower right")
+                plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
                 plt.tight_layout()
                 plt.savefig(os.path.join(output, "{}_scatter.pdf".format(split)))
                 plt.close(fig)
 
-                fig = plt.figure(figsize=(3, 3))
+                # --- 🚨 NEW: DERIVED EF SCATTER PLOT 🚨 ---
+                # y[:, 0] is EDV, y[:, 1] is ESV
+                # We add 1e-8 to the denominator to prevent division-by-zero crashes
+                y_ef = (y[:, 0] - y[:, 1]) / (y[:, 0] + 1e-8) * 100.0
+                yhat_ef = (yhat[:, 0] - yhat[:, 1]) / (yhat[:, 0] + 1e-8) * 100.0
+
+                fig_ef = plt.figure(figsize=(3, 3))
                 
-                # 1. Added a label for the baseline "No Skill" line
-                plt.plot([0, 1], [0, 1], linewidth=1, color="k", linestyle="--", label="No Skill")
+                # Cap the plot boundaries so outliers don't ruin the scale
+                lower_ef = max(0, min(y_ef.min(), yhat_ef.min()) - 5)
+                upper_ef = min(100, max(y_ef.max(), yhat_ef.max()) + 5)
+                
+                plt.scatter(y_ef, yhat_ef, color="g", s=1, edgecolor=None, zorder=2, label="Derived EF")
+                plt.plot([0, 100], [0, 100], linewidth=1, zorder=3, color="k")
+                plt.axis([lower_ef, upper_ef, lower_ef, upper_ef])
+                plt.gca().set_aspect("equal", "box")
+                plt.xlabel("Actual EF (%)")
+                plt.ylabel("Derived Predicted EF (%)")
+                plt.xticks([10, 20, 30, 40, 50, 60, 70, 80])
+                plt.yticks([10, 20, 30, 40, 50, 60, 70, 80])
+                plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
+                
+                # --- 🚨 ADD R2 TEXT BOX TO DERIVED EF PLOT 🚨 ---
+                r2_ef = sklearn.metrics.r2_score(y_ef, yhat_ef)
+                
+                # Pins a white text box to the top-left corner (0.05, 0.95)
+                plt.text(0.05, 0.95, f"$R^2$ = {r2_ef:.3f}", 
+                         transform=plt.gca().transAxes, fontsize=9, 
+                         verticalalignment='top', 
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), zorder=4)
+                # ------------------------------------------------
+                
+                plt.legend(loc="lower right")                
+                plt.tight_layout()
+                
+                # Save it as a separate PDF so it doesn't overwrite your volume plot
+                plt.savefig(os.path.join(output, "{}_scatter_derived_ef.pdf".format(split)))
+                plt.close(fig_ef)
+                # ----------------------------------------------------
+
+                # --- 🚨 NEW: DERIVED EF AUROC PLOT 🚨 ---
+                fig = plt.figure(figsize=(3, 3))
+                plt.plot([0, 1], [0, 1], linewidth=1, color="k", linestyle="--")
                 
                 for thresh in [35, 40, 45, 50]:
-                    fpr, tpr, _ = sklearn.metrics.roc_curve(y > thresh, yhat)
+                    # IMPORTANT: Use y_ef and yhat_ef here, not y and yhat!
+                    fpr, tpr, _ = sklearn.metrics.roc_curve(y_ef > thresh, yhat_ef)
+                    # Print the exact format you are looking for in the terminal
+                    auc_score = sklearn.metrics.roc_auc_score(y_ef > thresh, yhat_ef)
+                    print(f"{thresh}: {auc_score:.4f}")
                     
-                    # Calculate the AUC score so we can print it AND put it in the legend
-                    auc_score = sklearn.metrics.roc_auc_score(y > thresh, yhat)
-                    print(f"Threshold {thresh}: {auc_score:.4f}")
-                    
-                    # 2. Added the label argument here! This populates the legend.
-                    plt.plot(fpr, tpr, label=f"EF < {thresh} (AUC: {auc_score:.2f})")
+                    plt.plot(fpr, tpr)
 
                 plt.axis([-0.01, 1.01, -0.01, 1.01])
                 plt.xlabel("False Positive Rate")
                 plt.ylabel("True Positive Rate")
+                # --- 🚨 ADD R2 TEXT BOX TO DERIVED EF PLOT 🚨 ---
+                r2_ef = sklearn.metrics.r2_score(y_ef, yhat_ef)
                 
-                # 3. Added a faint grid to make the ROC curves easier to read visually
-                plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
+                # Pins a white text box to the top-left corner (0.05, 0.95)
+                plt.text(0.05, 0.95, f"$R^2$ = {r2_ef:.3f}", 
+                         transform=plt.gca().transAxes, fontsize=9, 
+                         verticalalignment='top', 
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), zorder=4)
+                # ------------------------------------------------
                 
-                # The legend will now automatically grab the labels we defined above
-                plt.legend(loc="lower right", fontsize="x-small")
-                
+                plt.legend(loc="upper left")
                 plt.tight_layout()
-                plt.savefig(os.path.join(output, "{}_roc.pdf".format(split)))
-                plt.close(fig)
                 
+                # Save as a specific derived_ef ROC plot
+                plt.savefig(os.path.join(output, "{}_roc_derived_ef.pdf".format(split)))
+                plt.close(fig)
+                # ----------------------------------------
+
+                # NOTE: AUROC Plot disabled for Configuration 2 because the model is predicting 
+                # continuous Volume variables (EDV/ESV), not binary threshold Ejection Fractions.
+
         # --- 🚨 DDP FIX 3: KEEP ALL GPUS ALIVE UNTIL THE VERY END 🚨 ---
-        # GPUs 1-5 will wait here peacefully while GPU 0 finishes the long test loop
         dist.barrier()
         if local_rank == 0:
             print("Evaluation and plotting complete! All GPUs shutting down safely.", flush=True)
 
 def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None, beta=1.0):
+    """Run one epoch of training/evaluation for Multi-Output Volumes."""
 
     model.train(train)
 
@@ -377,6 +432,10 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
         with tqdm.tqdm(total=len(dataloader), disable=(local_rank != 0)) as pbar:
             for (X, outcome) in dataloader:
 
+                # 1. Stack the EDV and ESV lists into a [batch, 2] tensor
+                if isinstance(outcome, (list, tuple)):
+                    outcome = torch.stack(outcome, dim=1).float()
+
                 y.append(outcome.numpy())
 
                 X = X.to(device)
@@ -390,25 +449,27 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                 # Upscale 112x112 to 224x224 directly on GPU
                 X = torch.nn.functional.interpolate(X, size=(X.shape[2], 224, 224), mode='trilinear', align_corners=False)
 
-                s1 += outcome.sum().item()
-                s2 += (outcome ** 2).sum().item()
+                # Track just EDV for the progress bar metrics to avoid weird math
+                s1 += outcome[:, 0].sum().item()
+                s2 += (outcome[:, 0] ** 2).sum().item()
 
                 if block_size is None:
                     outputs = model(X)
                 else:
                     outputs = torch.cat([model(X[j:(j + block_size), ...]) for j in range(0, X.shape[0], block_size)])
 
+                # 2. Keep the full 2D shape [batch, 2]
                 if save_all:
-                    yhat.append(outputs[:, 0].to("cpu").detach().numpy())
+                    yhat.append(outputs.to("cpu").detach().numpy())
 
                 if average:
                     outputs = outputs.view(batch, n_clips, -1).mean(1)
 
                 if not save_all:
-                    yhat.append(outputs[:, 0].to("cpu").detach().numpy())
+                    yhat.append(outputs.to("cpu").detach().numpy())
 
-                # Pure EF Smooth L1 Loss
-                loss = torch.nn.functional.smooth_l1_loss(outputs.view(-1), outcome, beta=beta)
+                # 3. Volume Regression Smooth L1 Loss 
+                loss = torch.nn.functional.smooth_l1_loss(outputs, outcome, beta=beta)
                 
                 if train:
                     optim.zero_grad()

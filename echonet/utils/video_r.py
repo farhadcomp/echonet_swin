@@ -1,4 +1,4 @@
-"""Functions for training and running EF prediction (swin3d)."""
+"""Functions for training and running Baseline EF prediction for R(2+1)D."""
 
 import math
 import os
@@ -40,7 +40,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 @click.option("--batch_size", type=int, default=20)
 @click.option("--device", type=str, default=None)
 @click.option("--seed", type=int, default=0)
-@click.option("--beta", type=float, default=1.0)
 def run(
     data_dir=None,
     output=None,
@@ -60,9 +59,8 @@ def run(
     batch_size=20,
     device=None,
     seed=0,
-    beta=1.0,
 ):
-    """Trains/tests EF prediction model."""
+    """Trains/tests baseline EF prediction model using R(2+1)D."""
 
     # Seed RNGs
     np.random.seed(seed)
@@ -82,23 +80,13 @@ def run(
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Set up model dynamically
-    if model_name == "swin3d_s":
-        if local_rank == 0:
-            print("Initializing Custom Swin3D-S Architecture (Baseline EF)...")
-        model = torchvision.models.video.swin3d_s(weights='KINETICS400_V1')
-        model.head = torch.nn.Sequential(
-            torch.nn.Dropout(p=0.5),
-            torch.nn.Linear(model.head.in_features, 1)
-        )
-        model.head[1].bias.data[0] = 55.6   # Average Ejection Fraction (%)
+    # --- Standard R(2+1)D Architecture ---
+    if local_rank == 0:
+        print(f"Initializing Baseline {model_name} Architecture (Baseline EF)...")
         
-    else:
-        if local_rank == 0:
-            print(f"Initializing Baseline {model_name} Architecture (Baseline EF)...")
-        model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
-        model.fc = torch.nn.Linear(model.fc.in_features, 1)
-        model.fc.bias.data[0] = 55.6   # Average EF
+    model = torchvision.models.video.__dict__[model_name](pretrained=pretrained)
+    model.fc = torch.nn.Linear(model.fc.in_features, 1)
+    model.fc.bias.data[0] = 55.6   # Average EF
 
     model.to(device)
 
@@ -109,34 +97,15 @@ def run(
         checkpoint = torch.load(weights, weights_only=False, map_location="cpu")
         model.load_state_dict(checkpoint['state_dict'])
 
-    # --- DIFFERENTIAL LEARNING RATES ---
+    # --- CLASSIC CNN ENGINE (SGD + StepLR) ---
     if local_rank == 0:
-        print("Applying Differential Learning Rates...", flush=True)
-    
-    for param in model.parameters():
-        param.requires_grad = True
-
-    base_params = []
-    head_params = []
-    
-    for name, param in model.named_parameters():
-        if "head" in name or "fc" in name:
-            head_params.append(param)
-        else:
-            base_params.append(param)
-
-    optim = torch.optim.AdamW([
-        {'params': base_params, 'lr': 1e-5},
-        {'params': head_params, 'lr': 1e-4}
-    ], weight_decay=weight_decay)
-
-    # Schedulers
-    from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-    warmup_epochs = 5
-    scheduler_warmup = LinearLR(optim, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-    # scheduler_cosine = CosineAnnealingLR(optim, T_max=(num_epochs - warmup_epochs))
-    scheduler_cosine = CosineAnnealingLR(optim, T_max=max(1, num_epochs - warmup_epochs))
-    scheduler = SequentialLR(optim, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_epochs])
+        print("Engine: SGD + Momentum + StepLR (Classic Mode)", flush=True)
+        
+    optim = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=weight_decay)
+    if lr_step_period is None:
+        lr_step_period = math.inf
+    scheduler = torch.optim.lr_scheduler.StepLR(optim, lr_step_period)
+    # -----------------------------------------
 
     # Compute mean and std
     mean, std = echonet.utils.get_mean_and_std(echonet.datasets.Echo(root=data_dir, split="train"))
@@ -162,7 +131,7 @@ def run(
         epoch_resume = 0
         bestLoss = float("inf")
         try:
-            checkpoint = torch.load(os.path.join(output, "checkpoint.pt"), map_location="cpu", weights_only=False)
+            checkpoint = torch.load(os.path.join(output, "checkpoint.pt"))
             model.load_state_dict(checkpoint['state_dict'])
             optim.load_state_dict(checkpoint['opt_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_dict'])
@@ -181,7 +150,7 @@ def run(
 
         for epoch in range(epoch_resume, num_epochs):
             if local_rank == 0:
-                print(f"Epoch #{epoch} | Baseline EF Only", flush=True)
+                print(f"Epoch #{epoch} | R(2+1)D Baseline EF Only", flush=True)
                 
             for phase in ['train', 'val']:
                 start_time = time.time()
@@ -202,7 +171,7 @@ def run(
                         shuffle=False, pin_memory=True, drop_last=False
                     )
 
-                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device, beta=beta)
+                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device)
                 
                 if local_rank == 0:
                     f.write("{},{},{},{},{},{},{},{},{}\n".format(epoch,
@@ -245,7 +214,6 @@ def run(
                         print("Early stopping triggered! Exiting safely...", flush=True)
                         should_stop += 1 
 
-            # Broadcast the stop flag and check it
             dist.broadcast(should_stop, src=0)
             if should_stop.item() == 1:
                 break 
@@ -271,8 +239,7 @@ def run(
                     echonet.datasets.Echo(root=data_dir, split=split, **kwargs),
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
                 
-                # CHANGED: Use model.module to bypass DDP expectations on a single GPU
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, beta=beta)
+                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device)
                 
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                 f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
@@ -284,8 +251,7 @@ def run(
                 dataloader = torch.utils.data.DataLoader(
                     ds, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 
-                # CHANGED: Use model.module here too
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size, beta=beta)
+                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size)
                 
                 f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
                 f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
@@ -299,6 +265,7 @@ def run(
                 echonet.utils.latexify()
                 yhat = np.array(list(map(lambda x: x.mean(), yhat)))
 
+                # --- Upgraded Scatter Plot with R2 Score ---
                 fig = plt.figure(figsize=(3, 3))
                 lower = min(y.min(), yhat.min())
                 upper = max(y.max(), yhat.max())
@@ -312,54 +279,42 @@ def run(
                 plt.yticks([10, 20, 30, 40, 50, 60, 70, 80])
                 plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
 
-                # --- 🚨 ADD R2 TEXT BOX HERE 🚨 ---
                 r2_val = sklearn.metrics.r2_score(y, yhat)
                 plt.text(0.05, 0.95, f"$R^2$ = {r2_val:.3f}", 
                          transform=plt.gca().transAxes, fontsize=9, 
                          verticalalignment='top', 
                          bbox=dict(boxstyle='round', facecolor='white', alpha=0.8), zorder=4)
-                # ----------------------------------
 
                 plt.tight_layout()
                 plt.savefig(os.path.join(output, "{}_scatter.pdf".format(split)))
                 plt.close(fig)
 
+                # --- Upgraded ROC Plot with Grid and Labels ---
                 fig = plt.figure(figsize=(3, 3))
-                
-                # 1. Added a label for the baseline "No Skill" line
                 plt.plot([0, 1], [0, 1], linewidth=1, color="k", linestyle="--", label="No Skill")
                 
                 for thresh in [35, 40, 45, 50]:
                     fpr, tpr, _ = sklearn.metrics.roc_curve(y > thresh, yhat)
-                    
-                    # Calculate the AUC score so we can print it AND put it in the legend
                     auc_score = sklearn.metrics.roc_auc_score(y > thresh, yhat)
                     print(f"Threshold {thresh}: {auc_score:.4f}")
-                    
-                    # 2. Added the label argument here! This populates the legend.
                     plt.plot(fpr, tpr, label=f"EF < {thresh} (AUC: {auc_score:.2f})")
 
                 plt.axis([-0.01, 1.01, -0.01, 1.01])
                 plt.xlabel("False Positive Rate")
                 plt.ylabel("True Positive Rate")
-                
-                # 3. Added a faint grid to make the ROC curves easier to read visually
                 plt.grid(color="gainsboro", linestyle="--", linewidth=1, zorder=1)
-                
-                # The legend will now automatically grab the labels we defined above
                 plt.legend(loc="lower right", fontsize="x-small")
-                
                 plt.tight_layout()
                 plt.savefig(os.path.join(output, "{}_roc.pdf".format(split)))
                 plt.close(fig)
-                
+
         # --- 🚨 DDP FIX 3: KEEP ALL GPUS ALIVE UNTIL THE VERY END 🚨 ---
-        # GPUs 1-5 will wait here peacefully while GPU 0 finishes the long test loop
         dist.barrier()
         if local_rank == 0:
             print("Evaluation and plotting complete! All GPUs shutting down safely.", flush=True)
 
-def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None, beta=1.0):
+def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None):
+    """Run one epoch of training/evaluation."""
 
     model.train(train)
 
@@ -387,8 +342,8 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                     batch, n_clips, c, f, h, w = X.shape
                     X = X.view(-1, c, f, h, w)
 
-                # Upscale 112x112 to 224x224 directly on GPU
-                X = torch.nn.functional.interpolate(X, size=(X.shape[2], 224, 224), mode='trilinear', align_corners=False)
+                # Upscale 112x112 to 224x224 directly on GPU (matches your pre-trained weights)
+                # X = torch.nn.functional.interpolate(X, size=(X.shape[2], 224, 224), mode='trilinear', align_corners=False)
 
                 s1 += outcome.sum().item()
                 s2 += (outcome ** 2).sum().item()
@@ -408,7 +363,7 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                     yhat.append(outputs[:, 0].to("cpu").detach().numpy())
 
                 # Pure EF Smooth L1 Loss
-                loss = torch.nn.functional.smooth_l1_loss(outputs.view(-1), outcome, beta=beta)
+                loss = torch.nn.functional.smooth_l1_loss(outputs.view(-1), outcome, beta=1.0)
                 
                 if train:
                     optim.zero_grad()

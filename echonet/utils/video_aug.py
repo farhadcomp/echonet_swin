@@ -1,4 +1,4 @@
-"""Functions for training and running EF prediction (swin3d)."""
+"""Functions for training and running EF prediction (Swin with Aug)."""
 
 import math
 import os
@@ -40,7 +40,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 @click.option("--batch_size", type=int, default=20)
 @click.option("--device", type=str, default=None)
 @click.option("--seed", type=int, default=0)
-@click.option("--beta", type=float, default=1.0)
 def run(
     data_dir=None,
     output=None,
@@ -60,7 +59,6 @@ def run(
     batch_size=20,
     device=None,
     seed=0,
-    beta=1.0,
 ):
     """Trains/tests EF prediction model."""
 
@@ -87,11 +85,14 @@ def run(
         if local_rank == 0:
             print("Initializing Custom Swin3D-S Architecture (Baseline EF)...")
         model = torchvision.models.video.swin3d_s(weights='KINETICS400_V1')
+        
+        # --- 🚨 STRATEGY 2: REGULARIZED HEAD ---
         model.head = torch.nn.Sequential(
-            torch.nn.Dropout(p=0.5),
+            torch.nn.Dropout(p=0.4), # Reduced to 40% Dropout
             torch.nn.Linear(model.head.in_features, 1)
         )
         model.head[1].bias.data[0] = 55.6   # Average Ejection Fraction (%)
+        # ---------------------------------------
         
     else:
         if local_rank == 0:
@@ -134,7 +135,6 @@ def run(
     from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
     warmup_epochs = 5
     scheduler_warmup = LinearLR(optim, start_factor=0.01, end_factor=1.0, total_iters=warmup_epochs)
-    # scheduler_cosine = CosineAnnealingLR(optim, T_max=(num_epochs - warmup_epochs))
     scheduler_cosine = CosineAnnealingLR(optim, T_max=max(1, num_epochs - warmup_epochs))
     scheduler = SequentialLR(optim, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_epochs])
 
@@ -202,7 +202,7 @@ def run(
                         shuffle=False, pin_memory=True, drop_last=False
                     )
 
-                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device, beta=beta)
+                loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device)
                 
                 if local_rank == 0:
                     f.write("{},{},{},{},{},{},{},{},{}\n".format(epoch,
@@ -272,7 +272,7 @@ def run(
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
                 
                 # CHANGED: Use model.module to bypass DDP expectations on a single GPU
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, beta=beta)
+                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device)
                 
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                 f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
@@ -285,7 +285,7 @@ def run(
                     ds, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 
                 # CHANGED: Use model.module here too
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size, beta=beta)
+                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size)
                 
                 f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
                 f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
@@ -359,7 +359,7 @@ def run(
         if local_rank == 0:
             print("Evaluation and plotting complete! All GPUs shutting down safely.", flush=True)
 
-def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None, beta=1.0):
+def run_epoch(model, dataloader, train, optim, device, save_all=False, block_size=None):
 
     model.train(train)
 
@@ -381,6 +381,25 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
 
                 X = X.to(device)
                 outcome = outcome.to(device)
+
+                # --- 🚨 STRATEGY 2: TEMPORAL CUTOUT AUGMENTATION ---
+                # Only apply during the 'train' phase, never during 'val' or 'test'
+                if train and torch.rand(1).item() > 0.5:
+                    # Create a 40x40 black box to hide a portion of the heart
+                    box_size = 40
+                    
+                    # This works dynamically whether X is 5D [B, C, F, H, W] or 6D [B, N, C, F, H, W]
+                    h_max = X.shape[-2] - box_size
+                    w_max = X.shape[-1] - box_size
+                    
+                    # Pick a random starting coordinate
+                    h_start = torch.randint(0, h_max, (1,)).item()
+                    w_start = torch.randint(0, w_max, (1,)).item()
+                    
+                    # Black out that specific square across ALL frames in the batch
+                    # This forces the Swin3D to rely on the rest of the heart's geometry
+                    X[..., h_start:h_start+box_size, w_start:w_start+box_size] = 0.0
+                # ---------------------------------------------------
 
                 average = (len(X.shape) == 6)
                 if average:
@@ -408,7 +427,7 @@ def run_epoch(model, dataloader, train, optim, device, save_all=False, block_siz
                     yhat.append(outputs[:, 0].to("cpu").detach().numpy())
 
                 # Pure EF Smooth L1 Loss
-                loss = torch.nn.functional.smooth_l1_loss(outputs.view(-1), outcome, beta=beta)
+                loss = torch.nn.functional.smooth_l1_loss(outputs.view(-1), outcome, beta=1.0)
                 
                 if train:
                     optim.zero_grad()

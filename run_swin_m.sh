@@ -16,7 +16,7 @@ export NCCL_DEBUG=WARN
 # ----------------------------------
 
 # Output directory specifically for the Baseline EF-Only run
-OUTPUT_DIR="output/comparison_ef_only_beta_5"
+OUTPUT_DIR="output/comparison_esv_edv_beta_20"
 DATA_DIR="/home/AD.UNLV.EDU/farhadik/echo_new/EchoNet-Dynamic"
 
 mkdir -p ${OUTPUT_DIR}
@@ -24,14 +24,14 @@ TRAIN_LOG="${OUTPUT_DIR}/training_terminal_output.txt"
 TEST_LOG="${OUTPUT_DIR}/testing_terminal_output.txt"
 
 echo "=========================================================="
-echo " Starting TRUE DDP Training: Baseline Swin3D (EF Only)"
+echo " Starting TRUE DDP Training: Baseline Swin3D (ESV and EDV)"
 echo "=========================================================="
 
 # Training on 6 GPUs (bypassing the frozen GPU 0)
-CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --nproc_per_node=4 \
-    --master_port=29507 \
-    echonet/utils/video.py \
+    --master_port=29509 \
+    echonet/utils/video_m.py \
     --data_dir ${DATA_DIR} \
     --output ${OUTPUT_DIR} \
     --model_name swin3d_s \
@@ -39,7 +39,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 torchrun \
     --batch_size 8 \
     --num_workers 8 \
     --lr 1e-4 \
-    --beta 5.0 \
+    --beta 20.0 \
     2>&1 | tee ${TRAIN_LOG}
 
 echo "========================================="
@@ -47,10 +47,10 @@ echo " Training Complete. Starting Evaluation."
 echo "========================================="
 
 # Testing the new Swin3D weights
-CUDA_VISIBLE_DEVICES=0 torchrun \
+CUDA_VISIBLE_DEVICES=4 torchrun \
     --nproc_per_node=1 \
-    --master_port=29508 \
-    echonet/utils/video.py \
+    --master_port=29510 \
+    echonet/utils/video_m.py \
     --data_dir ${DATA_DIR} \
     --output ${OUTPUT_DIR}/ \
     --model_name swin3d_s \
@@ -59,7 +59,7 @@ CUDA_VISIBLE_DEVICES=0 torchrun \
     --batch_size 1 \
     --num_workers 8 \
     --num_epochs 0 \
-    --beta 5.0 \
+    --beta 20.0 \
     2>&1 | tee ${TEST_LOG}
 
 python3 plot_metrics.py "$OUTPUT_DIR"

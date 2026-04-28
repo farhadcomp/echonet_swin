@@ -144,6 +144,7 @@ class Echo(torchvision.datasets.VisionDataset):
             self.outcome = [f for (f, k) in zip(self.outcome, keep) if k]
 
     def __getitem__(self, index):
+
         ## --- I comment these lines of codes ---
         # Find filename of video
         # if self.split == "EXTERNAL_TEST":
@@ -181,29 +182,40 @@ class Echo(torchvision.datasets.VisionDataset):
         # ## --- End of the edited code ---
         ## --- I have added these lines of codes --
         # Find filename of video
-        if self.split == "EXTERNAL_TEST":
-            video_path = os.path.join(self.external_test_location, self.fnames[index])
-            video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        elif self.split == "CLINICAL_TEST":
-            video_path = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
-            video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        else:
-            # FAST TENSOR LOADING (Bypasses CPU video decoding bottleneck)
-            fname = self.fnames[index]
-            if fname.endswith(".avi"):
-                fname = fname.replace(".avi", ".pt")
-            else:
-                fname = fname + ".pt"
+        # if self.split == "EXTERNAL_TEST":
+        #     video_path = os.path.join(self.external_test_location, self.fnames[index])
+        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
+        # elif self.split == "CLINICAL_TEST":
+        #     video_path = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
+        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
+        # else:
+        #     # FAST TENSOR LOADING (Bypasses CPU video decoding bottleneck)
+        #     fname = self.fnames[index]
+        #     if fname.endswith(".avi"):
+        #         fname = fname.replace(".avi", ".pt")
+        #     else:
+        #         fname = fname + ".pt"
                 
-            # UPDATED: Point to the resized 224x224 folder
-            tensor_path = os.path.join(self.root, "Tensors_224", fname)
+        #     # UPDATED: Point to the resized 224x224 folder
+        #     tensor_path = os.path.join(self.root, "Tensors_224", fname)
             
-            # UPDATED: Force CPU loading to prevent DataLoader VRAM leaks
-            video_tensor = torch.load(tensor_path, map_location='cpu', weights_only=True)
+        #     # UPDATED: Force CPU loading to prevent DataLoader VRAM leaks
+        #     video_tensor = torch.load(tensor_path, map_location='cpu', weights_only=True)
             
-            # Convert to numpy to match the rest of the legacy EchoNet pipeline
-            video = (video_tensor.float() / 255.0).numpy().astype(np.float32)
-        ## --- End of the edited code ---
+        #     # Convert to numpy to match the rest of the legacy EchoNet pipeline
+        #     video = (video_tensor.float() / 255.0).numpy().astype(np.float32)
+        # ## --- End of the edited code ---
+
+        # Find filename of video
+        if self.split == "EXTERNAL_TEST":
+            video = os.path.join(self.external_test_location, self.fnames[index])
+        elif self.split == "CLINICAL_TEST":
+            video = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
+        else:
+            video = os.path.join(self.root, "Videos", self.fnames[index])
+
+        # Load video into np.array using PyAV
+        video = echonet.utils.loadvideo(video).astype(np.float32)
 
         # Add simulated noise (black out random pixels)
         # 0 represents black at this point (video has not been normalized yet)
