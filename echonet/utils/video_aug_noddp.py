@@ -14,9 +14,12 @@ import torchvision
 import tqdm
 
 import echonet
-import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
-from torch.nn.parallel import DistributedDataParallel as DDP
+# import torch.distributed as dist
+# from torch.utils.data.distributed import DistributedSampler
+# from torch.nn.parallel import DistributedDataParallel as DDP
+
+def unwrap_model(model):
+    return model.module if hasattr(model, "module") else model
 
 @click.command("video")
 @click.option("--data_dir", type=click.Path(exists=True, file_okay=False), default=None)
@@ -43,6 +46,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 @click.option("--beta", type=float, default=1.0)
 @click.option('--pad', type=int, default=None, help='Pixels to pad for spatial translation.')
 @click.option("--augment/--no-augment", default=False)
+
+
 def run(
     data_dir=None,
     output=None,
@@ -72,11 +77,11 @@ def run(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # --- DDP Initialization ---
-    dist.init_process_group(backend='nccl')
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    # --- Non-DDP device setup ---
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    local_rank = 0
     # --------------------------
 
     if local_rank == 0:
@@ -112,8 +117,9 @@ def run(
 
     model.to(device)
 
-    # Wrap model with DDP
-    model = DDP(model, device_ids=[local_rank], find_unused_parameters=True)
+    if device.type == "cuda" and torch.cuda.device_count() > 1:
+        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs", flush=True)
+        model = torch.nn.DataParallel(model)
 
     if weights is not None:
         checkpoint = torch.load(weights, weights_only=False, map_location="cpu")
@@ -216,16 +222,22 @@ def run(
                 ds = dataset[phase]
                 
                 if phase == "train":
-                    sampler = DistributedSampler(ds, shuffle=True)
-                    sampler.set_epoch(epoch)
                     dataloader = torch.utils.data.DataLoader(
-                        ds, batch_size=batch_size, num_workers=num_workers, 
-                        sampler=sampler, pin_memory=True, drop_last=True
+                        ds,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        shuffle=True,
+                        pin_memory=(device.type == "cuda"),
+                        drop_last=True
                     )
                 else:
                     dataloader = torch.utils.data.DataLoader(
-                        ds, batch_size=batch_size, num_workers=num_workers, 
-                        shuffle=False, pin_memory=True, drop_last=False
+                        ds,
+                        batch_size=batch_size,
+                        num_workers=num_workers,
+                        shuffle=False,
+                        pin_memory=(device.type == "cuda"),
+                        drop_last=False
                     )
 
                 loss, yhat, y = run_epoch(model, dataloader, phase == "train", optim, device, beta=beta, augment=augment)
@@ -243,7 +255,7 @@ def run(
                     f.flush()
 
             # --- 🚨 DDP FIX 1: ONLY GPU 0 SAVES CHECKPOINTS 🚨 ---
-            should_stop = torch.tensor(0).to(device) 
+            # should_stop = torch.tensor(0).to(device) 
 
             if local_rank == 0:
                 save = {
@@ -267,22 +279,22 @@ def run(
                     patience_counter += 1
                     print("Early stopping counter: {} out of {}".format(patience_counter, patience), flush=True)
                     
-                    if patience_counter >= patience:
-                        print("Early stopping triggered! Exiting safely...", flush=True)
-                        should_stop += 1 
+                    # if patience_counter >= patience:
+                    #     print("Early stopping triggered! Exiting safely...", flush=True)
+                    #     should_stop += 1 
 
             # Broadcast the stop flag and check it
-            dist.broadcast(should_stop, src=0)
-            if should_stop.item() == 1:
-                break 
+            # # dist.broadcast(should_stop, src=0)
+            # if should_stop.item() == 1:
+            #     break 
             
-            dist.barrier()
+            # # dist.barrier()
             scheduler.step()
             # -------------------------------------------------------------
 
         # Load best weights
         if num_epochs != 0:
-            dist.barrier() 
+            # dist.barrier() 
             checkpoint = torch.load(os.path.join(output, "best.pt"), map_location="cpu", weights_only=False)
             model.load_state_dict(checkpoint['state_dict'])
             if local_rank == 0:
@@ -298,7 +310,8 @@ def run(
                     batch_size=batch_size, num_workers=num_workers, shuffle=True, pin_memory=(device.type == "cuda"))
                 
                 # CHANGED: Use model.module to bypass DDP expectations on a single GPU
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, beta=beta)
+                # loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, beta=beta)
+                loss, yhat, y = run_epoch(unwrap_model(model), dataloader, False, None, device, beta=beta)
                 
                 f.write("{} (one clip) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.r2_score)))
                 f.write("{} (one clip) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, yhat, sklearn.metrics.mean_absolute_error)))
@@ -311,8 +324,18 @@ def run(
                     ds, batch_size=1, num_workers=num_workers, shuffle=False, pin_memory=(device.type == "cuda"))
                 
                 # CHANGED: Use model.module here too
-                loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size, beta=beta)
-                
+                # loss, yhat, y = run_epoch(model.module, dataloader, False, None, device, save_all=True, block_size=batch_size, beta=beta)
+                loss, yhat, y = run_epoch(
+                    unwrap_model(model),
+                    dataloader,
+                    False,
+                    None,
+                    device,
+                    save_all=True,
+                    block_size=batch_size,
+                    beta=beta
+                )
+
                 f.write("{} (all clips) R2:   {:.3f} ({:.3f} - {:.3f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.r2_score)))
                 f.write("{} (all clips) MAE:  {:.2f} ({:.2f} - {:.2f})\n".format(split, *echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_absolute_error)))
                 f.write("{} (all clips) RMSE: {:.2f} ({:.2f} - {:.2f})\n".format(split, *tuple(map(math.sqrt, echonet.utils.bootstrap(y, np.array(list(map(lambda x: x.mean(), yhat))), sklearn.metrics.mean_squared_error)))))
@@ -381,7 +404,7 @@ def run(
                 
         # --- 🚨 DDP FIX 3: KEEP ALL GPUS ALIVE UNTIL THE VERY END 🚨 ---
         # GPUs 1-5 will wait here peacefully while GPU 0 finishes the long test loop
-        dist.barrier()
+        # dist.barrier()
         if local_rank == 0:
             print("Evaluation and plotting complete! All GPUs shutting down safely.", flush=True)
 

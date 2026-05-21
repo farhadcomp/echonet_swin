@@ -9,6 +9,7 @@ import skimage.draw
 import torchvision
 import echonet
 import torch
+import pandas as pd
 
 
 class Echo(torchvision.datasets.VisionDataset):
@@ -68,6 +69,7 @@ class Echo(torchvision.datasets.VisionDataset):
                  clips=1,
                  pad=None,
                  noise=None,
+                 augment=False,
                  target_transform=None,
                  external_test_location=None):
         if root is None:
@@ -87,10 +89,26 @@ class Echo(torchvision.datasets.VisionDataset):
         self.clips = clips
         self.pad = pad
         self.noise = noise
+        self.augment = augment
+        self._aug_print_count = 0
         self.target_transform = target_transform
         self.external_test_location = external_test_location
 
         self.fnames, self.outcome = [], []
+
+        # --- 🚨 PATH A: LOAD HEARTBEAT MAP 🚨 ---
+        # We read VolumeTracings.csv to find the exact frame where the heartbeat starts
+        tracing_csv = os.path.join(self.root, "VolumeTracings.csv")
+        if os.path.exists(tracing_csv):
+            df_traces = pd.read_csv(tracing_csv)
+            # VolumeTracings contains two frames per video (ED and ES). 
+            # The smaller frame index is almost always the End-Diastolic (ED) frame, 
+            # which marks the beginning of the contraction.
+            self.ed_frames = df_traces.groupby("FileName")["Frame"].min().to_dict()
+        else:
+            print("WARNING: VolumeTracings.csv not found. Falling back to random frames.")
+            self.ed_frames = {}
+        # ----------------------------------------
 
         if self.split == "EXTERNAL_TEST":
             self.fnames = sorted(os.listdir(self.external_test_location))
@@ -213,9 +231,55 @@ class Echo(torchvision.datasets.VisionDataset):
             video = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
         else:
             video = os.path.join(self.root, "Videos", self.fnames[index])
+            # video = os.path.join(self.root, "MaskedVideos", self.fnames[index])
+            # video = os.path.join(self.root, "MaskedVideos_SmoothDilated", self.fnames[index])
+            # video = os.path.join(self.root, "Videos_AttentionMask", self.fnames[index])
 
         # Load video into np.array using PyAV
         video = echonet.utils.loadvideo(video).astype(np.float32)
+
+        # --- 🚨 BOUNDING BOX AUTO-CROP (THE "ZOOM") 🚨 ---
+        # 1. Collapse the video across channels (0) and frames (1) to find all non-zero pixels
+        USE_AUTOCROP = False
+        if USE_AUTOCROP:
+            spatial_mask = video.sum(axis=(0, 1))
+            
+            # 2. Find the coordinates of the bounding box
+            rows = np.any(spatial_mask, axis=1)
+            cols = np.any(spatial_mask, axis=0)
+            
+            # Safety check: Only crop if the mask isn't completely empty
+            if rows.any() and cols.any():
+                # Get the exact min and max coordinates
+                rmin, rmax = np.where(rows)[0][[0, -1]]
+                cmin, cmax = np.where(cols)[0][[0, -1]]
+                
+                # Add a 5-pixel padding buffer. 
+                # (Crucial so we don't accidentally slice off the edge of the heart wall!)
+                pad = 5
+                rmin = max(0, rmin - pad)
+                rmax = min(video.shape[2], rmax + pad + 1)
+                cmin = max(0, cmin - pad)
+                cmax = min(video.shape[3], cmax + pad + 1)
+                
+                # 3. Crop the video
+                cropped_video = video[:, :, rmin:rmax, cmin:cmax]
+                
+                # 4. Resize back up to 112x112 using PyTorch (the fastest interpolation)
+                import torch.nn.functional as F
+                import torch
+                
+                orig_h, orig_w = video.shape[2], video.shape[3]
+                
+                # Rearrange to [frames, channels, height, width] for standard 2D interpolation
+                cropped_tensor = torch.from_numpy(cropped_video).permute(1, 0, 2, 3) 
+                
+                # Stretch the cropped heart to fill the entire 112x112 frame
+                resized_tensor = F.interpolate(cropped_tensor, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
+                
+                # Return it back to the original [channels, frames, height, width] numpy array format
+                video = resized_tensor.permute(1, 0, 2, 3).numpy()
+        # ---------------------------------------------------------
 
         # Add simulated noise (black out random pixels)
         # 0 represents black at this point (video has not been normalized yet)
@@ -260,11 +324,80 @@ class Echo(torchvision.datasets.VisionDataset):
             c, f, h, w = video.shape  # pylint: disable=E0633
 
         if self.clips == "all":
-            # Take all possible clips of desired length
-            start = np.arange(f - (length - 1) * self.period)
+            # --- 🚨 INTELLIGENT PHASE 1 INFERENCE (PEAK DETECTION) 🚨 ---
+            import scipy.signal
+            
+            # 1. Calculate the area of the heart in every frame. 
+            # Because we are using MaskedVideos, the background is 0. 
+            # Summing the pixels perfectly tracks the size of the heart over time!
+            frame_sizes = video.sum(axis=(0, 2, 3))
+            
+            # 2. Find the peaks (End-Diastole) of the wave
+            # distance=15 ensures we don't count the same heartbeat twice
+            peaks, _ = scipy.signal.find_peaks(frame_sizes, distance=15)
+            
+            # 3. Filter the peaks so we only keep ones that have enough room 
+            # for a full 32-frame contraction clip
+            start = []
+            for p in peaks:
+                if p + (length * self.period) <= f:
+                    start.append(p)
+                    
+            # 4. Fallback: If it's a highly unusual video and it found no peaks, 
+            # safely fall back to the sliding window
+            if len(start) == 0:
+                start = np.arange(f - (length - 1) * self.period)
+            # -----------------------------------------------------------
         else:
             # Take random clips from video
-            start = np.random.choice(f - (length - 1) * self.period, self.clips)
+            # start = np.random.choice(f - (length - 1) * self.period, self.clips)
+            # --- 🚨 PATH A: TARGETED HEARTBEAT EXTRACTION 🚨 ---
+            video_filename = self.fnames[index] + ".avi"
+            # video_filename = self.fnames[index]
+            # if index < 10:
+            #     print(video_filename, video_filename in self.ed_frames)
+            
+            # 1. Try to start the clip exactly at the End-Diastolic frame
+            if hasattr(self, 'ed_frames') and video_filename in self.ed_frames:
+                start = int(self.ed_frames[video_filename])
+            else:
+                # Fallback to random if this specific video is missing from the CSV
+                start = np.random.randint(0, max(1, f - length * self.period + 1))
+            
+            # 2. Safety Catch: Prevent PyTorch from crashing!
+            # If the ED frame is too close to the end of the video, we won't have 
+            # enough frames to make a full 32-frame clip. We must slide the window back.
+            if start + (length * self.period) > f:
+                start = max(0, f - (length * self.period))
+            # ---------------------------------------------------
+            # 3. wrap it in a list
+            start = [start]
+        # else:
+        #     # --- TARGETED ED-BASED TEMPORAL JITTER ---
+        #     # During training, sample a clip near the ED frame.
+        #     # During validation/test one-clip, use the exact ED frame.
+
+        #     video_filename = self.fnames[index]  # already includes ".avi"
+
+        #     max_start = max(1, f - length * self.period + 1)
+
+        #     if hasattr(self, "ed_frames") and video_filename in self.ed_frames:
+        #         ed_start = int(self.ed_frames[video_filename])
+        #     else:
+        #         ed_start = np.random.randint(0, max_start)
+
+        #     if self.split == "TRAIN":
+        #         # Try jitter=4 first. Later test 8.
+        #         jitter = 4
+        #         offset = np.random.randint(-jitter, jitter + 1)
+        #         start = ed_start + offset
+        #     else:
+        #         start = ed_start
+
+        #     # Safety: keep start valid
+        #     start = max(0, min(start, f - length * self.period))
+
+        #     start = [start]
 
         # Gather targets
         target = []
@@ -309,8 +442,13 @@ class Echo(torchvision.datasets.VisionDataset):
 
         # phyisc-informerd(begin)
         if target != []:
-            # CHANGED: Return a numpy array so PyTorch collates it into a single 2D Tensor
-            target = np.array(target, dtype=np.float32) if len(target) > 1 else target[0]
+            # Check if the first target item is an array (like an image/mask)
+            if isinstance(target[0], (np.ndarray, str)):
+                # Segmentation Task -> Return as a Tuple so shapes don't clash
+                target = tuple(target) if len(target) > 1 else target[0]
+            else:
+                # EF/Volume Task -> Return as a Numpy array for smooth 2D Tensor collation
+                target = np.array(target, dtype=np.float32) if len(target) > 1 else target[0]
             
             if self.target_transform is not None:
                 target = self.target_transform(target)
@@ -332,6 +470,57 @@ class Echo(torchvision.datasets.VisionDataset):
             temp[:, :, self.pad:-self.pad, self.pad:-self.pad] = video  # pylint: disable=E1130
             i, j = np.random.randint(0, 2 * self.pad, 2)
             video = temp[:, :, i:(i + h), j:(j + w)]
+
+        # --- 🚨 HIGH-VALUE VIDEO AUGMENTATIONS 🚨 ---
+        # Apply ONLY during training to the final extracted clip
+        # --- LIGHT VIDEO AUGMENTATION ---
+        # if self.split == "TRAIN" and self.augment:
+        #     if self._aug_print_count < 5:
+        #         print(f"[DEBUG] Echo augmentation running: split={self.split}, augment={self.augment}", flush=True)
+        #         self._aug_print_count += 1
+        #     import torchvision.transforms.functional as TF
+        #     import random
+        #     import torch
+
+        #     if isinstance(video, np.ndarray):
+        #         vid_tensor = torch.from_numpy(video)
+        #     else:
+        #         vid_tensor = video
+
+        #     # [C, F, H, W] -> [F, C, H, W]
+        #     vid_tensor = vid_tensor.permute(1, 0, 2, 3)
+
+        #     # Light augmentation for already-masked/autocropped echo videos
+        #     angle = random.uniform(-5, 5)
+        #     scale = random.uniform(0.97, 1.03)
+        #     brightness = random.uniform(0.95, 1.05)
+        #     contrast = random.uniform(0.95, 1.05)
+
+        #     vid_tensor = TF.affine(
+        #         vid_tensor,
+        #         angle=angle,
+        #         translate=[0, 0],
+        #         scale=scale,
+        #         shear=0,
+        #         interpolation=TF.InterpolationMode.BILINEAR
+        #     )
+
+        #     vid_tensor = TF.adjust_brightness(vid_tensor, brightness)
+        #     vid_tensor = TF.adjust_contrast(vid_tensor, contrast)
+
+        #     video = vid_tensor.permute(1, 0, 2, 3).numpy()
+        # --------------------------------------------
+        if self.split == "TRAIN" and self.augment:
+            print("Doing Augmentation!")
+            import random
+            # Make sure array is writable and float32
+            video = np.ascontiguousarray(video, dtype=np.float32)
+
+            if random.random() < 0.5:
+                scale = random.uniform(0.97, 1.03)
+                video = video * scale
+
+            video = np.clip(video, -5.0, 5.0).astype(np.float32)
 
         return video, target
 
