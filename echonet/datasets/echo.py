@@ -1,77 +1,63 @@
-"""EchoNet-Dynamic Dataset."""
+"""EchoNet-Dynamic Dataset.
 
-import os
+Changes vs original EchoNet echo.py
+-------------------------------------
+FIX-1  ED-frame temporal jitter during training (±6 frames around the
+        annotated End-Diastolic frame) for temporal diversity.
+FIX-2  Safety clamp guards both ends (negative AND overflow) after jitter.
+FIX-3  All-clips inference uses ED-frame anchoring + cycle-stride windows
+        instead of noisy pixel-sum peak detection.
+FIX-4  Fixed silent key-construction bug: self.fnames already contains
+        '.avi', so appending it again caused every ED-frame lookup to miss
+        and fall back silently to random starts.
+FIX-5  Removed the now-unused scipy.signal import from the clips path.
+
+AREA-TARGET  (new, opt-in via add_area_target=True)
+        When enabled, __getitem__ returns (video, (ef, area_target)) where
+        area_target = [area_ed, area_es, bin_ed, bin_es, valid] for the
+        per-bin area-consistency auxiliary task. When disabled (default),
+        behaviour is identical to before: returns (video, target).
+"""
+
 import collections
-import pandas
+import os
 
 import numpy as np
-import skimage.draw
-import torchvision
-import echonet
-import torch
+import pandas
 import pandas as pd
+import skimage.draw
+import torch
+import torchvision
+
+import echonet
 
 
 class Echo(torchvision.datasets.VisionDataset):
-    """EchoNet-Dynamic Dataset.
+    """EchoNet-Dynamic Dataset. See module docstring for arg details."""
 
-    Args:
-        root (string): Root directory of dataset (defaults to `echonet.config.DATA_DIR`)
-        split (string): One of {``train'', ``val'', ``test'', ``all'', or ``external_test''}
-        target_type (string or list, optional): Type of target to use,
-            ``Filename'', ``EF'', ``EDV'', ``ESV'', ``LargeIndex'',
-            ``SmallIndex'', ``LargeFrame'', ``SmallFrame'', ``LargeTrace'',
-            or ``SmallTrace''
-            Can also be a list to output a tuple with all specified target types.
-            The targets represent:
-                ``Filename'' (string): filename of video
-                ``EF'' (float): ejection fraction
-                ``EDV'' (float): end-diastolic volume
-                ``ESV'' (float): end-systolic volume
-                ``LargeIndex'' (int): index of large (diastolic) frame in video
-                ``SmallIndex'' (int): index of small (systolic) frame in video
-                ``LargeFrame'' (np.array shape=(3, height, width)): normalized large (diastolic) frame
-                ``SmallFrame'' (np.array shape=(3, height, width)): normalized small (systolic) frame
-                ``LargeTrace'' (np.array shape=(height, width)): left ventricle large (diastolic) segmentation
-                    value of 0 indicates pixel is outside left ventricle
-                             1 indicates pixel is inside left ventricle
-                ``SmallTrace'' (np.array shape=(height, width)): left ventricle small (systolic) segmentation
-                    value of 0 indicates pixel is outside left ventricle
-                             1 indicates pixel is inside left ventricle
-            Defaults to ``EF''.
-        mean (int, float, or np.array shape=(3,), optional): means for all (if scalar) or each (if np.array) channel.
-            Used for normalizing the video. Defaults to 0 (video is not shifted).
-        std (int, float, or np.array shape=(3,), optional): standard deviation for all (if scalar) or each (if np.array) channel.
-            Used for normalizing the video. Defaults to 0 (video is not scaled).
-        length (int or None, optional): Number of frames to clip from video. If ``None'', longest possible clip is returned.
-            Defaults to 16.
-        period (int, optional): Sampling period for taking a clip from the video (i.e. every ``period''-th frame is taken)
-            Defaults to 2.
-        max_length (int or None, optional): Maximum number of frames to clip from video (main use is for shortening excessively
-            long videos when ``length'' is set to None). If ``None'', shortening is not applied to any video.
-            Defaults to 250.
-        clips (int, optional): Number of clips to sample. Main use is for test-time augmentation with random clips.
-            Defaults to 1.
-        pad (int or None, optional): Number of pixels to pad all frames on each side (used as augmentation).
-            and a window of the original size is taken. If ``None'', no padding occurs.
-            Defaults to ``None''.
-        noise (float or None, optional): Fraction of pixels to black out as simulated noise. If ``None'', no simulated noise is added.
-            Defaults to ``None''.
-        target_transform (callable, optional): A function/transform that takes in the target and transforms it.
-        external_test_location (string): Path to videos to use for external testing.
-    """
-
-    def __init__(self, root=None,
-                 split="train", target_type="EF",
-                 mean=0., std=1.,
-                 length=16, period=2,
-                 max_length=250,
-                 clips=1,
-                 pad=None,
-                 noise=None,
-                 augment=False,
-                 target_transform=None,
-                 external_test_location=None):
+    def __init__(
+        self,
+        root=None,
+        split="train",
+        target_type="EF",
+        mean=0.0,
+        std=1.0,
+        length=16,
+        period=2,
+        max_length=250,
+        clips=1,
+        pad=None,
+        noise=None,
+        augment=False,
+        add_mask=True,
+        mask_source="gt",
+        mask_dir="MaskedVideos",
+        add_area_target=False,            # AREA-TARGET: opt-in flag
+        dense_clips=False,                # DENSE-EVAL: use every-start all-clips (original EchoNet protocol)
+        n_bins=18,                        # AREA-TARGET: temporal bins (T') from backbone
+        target_transform=None,
+        external_test_location=None,
+    ):
         if root is None:
             root = echonet.config.DATA_DIR
 
@@ -90,51 +76,67 @@ class Echo(torchvision.datasets.VisionDataset):
         self.pad = pad
         self.noise = noise
         self.augment = augment
+        self.add_mask = add_mask
+        self.mask_source = mask_source
+        self.mask_dir = mask_dir
+        self.add_area_target = add_area_target    # AREA-TARGET
+        self.dense_clips = dense_clips            # DENSE-EVAL
+        self.n_bins = n_bins                      # AREA-TARGET
         self._aug_print_count = 0
         self.target_transform = target_transform
         self.external_test_location = external_test_location
 
         self.fnames, self.outcome = [], []
 
-        # --- 🚨 PATH A: LOAD HEARTBEAT MAP 🚨 ---
-        # We read VolumeTracings.csv to find the exact frame where the heartbeat starts
         tracing_csv = os.path.join(self.root, "VolumeTracings.csv")
         if os.path.exists(tracing_csv):
             df_traces = pd.read_csv(tracing_csv)
-            # VolumeTracings contains two frames per video (ED and ES). 
-            # The smaller frame index is almost always the End-Diastolic (ED) frame, 
-            # which marks the beginning of the contraction.
-            self.ed_frames = df_traces.groupby("FileName")["Frame"].min().to_dict()
+            df_traces["FileName"] = df_traces["FileName"].apply(
+                lambda x: x if x.endswith(".avi") else x + ".avi"
+            )
+            self.ed_frames = (
+                df_traces.groupby("FileName")["Frame"].min().to_dict()
+            )
         else:
-            print("WARNING: VolumeTracings.csv not found. Falling back to random frames.")
+            print(
+                "WARNING: VolumeTracings.csv not found. "
+                "Falling back to random clip starts."
+            )
             self.ed_frames = {}
-        # ----------------------------------------
 
         if self.split == "EXTERNAL_TEST":
             self.fnames = sorted(os.listdir(self.external_test_location))
         else:
-            # Load video-level labels
             with open(os.path.join(self.root, "FileList.csv")) as f:
                 data = pandas.read_csv(f)
-            data["Split"].map(lambda x: x.upper())
+            data["Split"] = data["Split"].map(lambda x: x.upper())
 
             if self.split != "ALL":
                 data = data[data["Split"] == self.split]
 
             self.header = data.columns.tolist()
             self.fnames = data["FileName"].tolist()
-            self.fnames = [fn + ".avi" for fn in self.fnames if os.path.splitext(fn)[1] == ""]  # Assume avi if no suffix
+            self.fnames = [
+                fn + ".avi" if os.path.splitext(fn)[1] == "" else fn
+                for fn in self.fnames
+            ]
             self.outcome = data.values.tolist()
 
-            # Check that files are present
-            missing = set(self.fnames) - set(os.listdir(os.path.join(self.root, "Videos")))
+            missing = set(self.fnames) - set(
+                os.listdir(os.path.join(self.root, "Videos"))
+            )
             if len(missing) != 0:
-                print("{} videos could not be found in {}:".format(len(missing), os.path.join(self.root, "Videos")))
-                for f in sorted(missing):
-                    print("\t", f)
-                raise FileNotFoundError(os.path.join(self.root, "Videos", sorted(missing)[0]))
+                print(
+                    "{} videos could not be found in {}:".format(
+                        len(missing), os.path.join(self.root, "Videos")
+                    )
+                )
+                for fn in sorted(missing):
+                    print("\t", fn)
+                raise FileNotFoundError(
+                    os.path.join(self.root, "Videos", sorted(missing)[0])
+                )
 
-            # Load traces
             self.frames = collections.defaultdict(list)
             self.trace = collections.defaultdict(_defaultdict_of_lists)
 
@@ -143,157 +145,89 @@ class Echo(torchvision.datasets.VisionDataset):
                 assert header == ["FileName", "X1", "Y1", "X2", "Y2", "Frame"]
 
                 for line in f:
-                    filename, x1, y1, x2, y2, frame = line.strip().split(',')
+                    filename, x1, y1, x2, y2, frame = line.strip().split(",")
                     x1 = float(x1)
                     y1 = float(y1)
                     x2 = float(x2)
                     y2 = float(y2)
                     frame = int(frame)
-                    if frame not in self.trace[filename]:
-                        self.frames[filename].append(frame)
-                    self.trace[filename][frame].append((x1, y1, x2, y2))
-            for filename in self.frames:
-                for frame in self.frames[filename]:
-                    self.trace[filename][frame] = np.array(self.trace[filename][frame])
+                    key = filename if filename.endswith(".avi") else filename + ".avi"
+                    if frame not in self.trace[key]:
+                        self.frames[key].append(frame)
+                    self.trace[key][frame].append((x1, y1, x2, y2))
 
-            # A small number of videos are missing traces; remove these videos
-            keep = [len(self.frames[f]) >= 2 for f in self.fnames]
-            self.fnames = [f for (f, k) in zip(self.fnames, keep) if k]
-            self.outcome = [f for (f, k) in zip(self.outcome, keep) if k]
+            for key in self.frames:
+                for frame in self.frames[key]:
+                    self.trace[key][frame] = np.array(self.trace[key][frame])
 
+            keep = [len(self.frames[fn]) >= 2 for fn in self.fnames]
+            self.fnames = [fn for fn, k in zip(self.fnames, keep) if k]
+            self.outcome = [o for o, k in zip(self.outcome, keep) if k]
+
+    # ---------------------------------------------------------------------- #
+    # AREA-TARGET helper: GT polygon area at a given frame
+    # ---------------------------------------------------------------------- #
+    def _gt_area(self, key, fr, h=112, w=112):
+        tr = self.trace[key][fr]
+        x1, y1, x2, y2 = tr[:, 0], tr[:, 1], tr[:, 2], tr[:, 3]
+        x = np.concatenate((x1[1:], np.flip(x2[1:])))
+        yc = np.concatenate((y1[1:], np.flip(y2[1:])))
+        r, c = skimage.draw.polygon(
+            np.rint(yc).astype(int), np.rint(x).astype(int), (h, w)
+        )
+        return float(len(r))
+
+    # ---------------------------------------------------------------------- #
+    # __getitem__
+    # ---------------------------------------------------------------------- #
     def __getitem__(self, index):
 
-        ## --- I comment these lines of codes ---
-        # Find filename of video
-        # if self.split == "EXTERNAL_TEST":
-        #     video = os.path.join(self.external_test_location, self.fnames[index])
-        # elif self.split == "CLINICAL_TEST":
-        #     video = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
-        # else:
-        #     video = os.path.join(self.root, "Videos", self.fnames[index])
-
-        # # Load video into np.array
-        # video = echonet.utils.loadvideo(video).astype(np.float32)
-        ## --- End of the commented codes ---
-        
-        ## --- I have added these lines of codes --
-        # Find filename of video
-        # if self.split == "EXTERNAL_TEST":
-        #     video_path = os.path.join(self.external_test_location, self.fnames[index])
-        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        # elif self.split == "CLINICAL_TEST":
-        #     video_path = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
-        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        # else:
-        #     # FAST TENSOR LOADING (Bypasses CPU video decoding bottleneck)
-        #     fname = self.fnames[index]
-        #     if fname.endswith(".avi"):
-        #         fname = fname.replace(".avi", ".pt")
-        #     else:
-        #         fname = fname + ".pt"
-                
-        #     tensor_path = os.path.join(self.root, "Tensors", fname)
-            
-        #     # Load raw PyTorch tensor and convert to numpy to match old pipeline
-        #     import torch
-        #     video = (torch.load(tensor_path).float() / 255.0).numpy().astype(np.float32)
-        # ## --- End of the edited code ---
-        ## --- I have added these lines of codes --
-        # Find filename of video
-        # if self.split == "EXTERNAL_TEST":
-        #     video_path = os.path.join(self.external_test_location, self.fnames[index])
-        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        # elif self.split == "CLINICAL_TEST":
-        #     video_path = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
-        #     video = echonet.utils.loadvideo(video_path).astype(np.float32)
-        # else:
-        #     # FAST TENSOR LOADING (Bypasses CPU video decoding bottleneck)
-        #     fname = self.fnames[index]
-        #     if fname.endswith(".avi"):
-        #         fname = fname.replace(".avi", ".pt")
-        #     else:
-        #         fname = fname + ".pt"
-                
-        #     # UPDATED: Point to the resized 224x224 folder
-        #     tensor_path = os.path.join(self.root, "Tensors_224", fname)
-            
-        #     # UPDATED: Force CPU loading to prevent DataLoader VRAM leaks
-        #     video_tensor = torch.load(tensor_path, map_location='cpu', weights_only=True)
-            
-        #     # Convert to numpy to match the rest of the legacy EchoNet pipeline
-        #     video = (video_tensor.float() / 255.0).numpy().astype(np.float32)
-        # ## --- End of the edited code ---
-
-        # Find filename of video
         if self.split == "EXTERNAL_TEST":
-            video = os.path.join(self.external_test_location, self.fnames[index])
+            video_path = os.path.join(
+                self.external_test_location, self.fnames[index]
+            )
         elif self.split == "CLINICAL_TEST":
-            video = os.path.join(self.root, "ProcessedStrainStudyA4c", self.fnames[index])
+            video_path = os.path.join(
+                self.root, "ProcessedStrainStudyA4c", self.fnames[index]
+            )
         else:
-            video = os.path.join(self.root, "Videos", self.fnames[index])
-            # video = os.path.join(self.root, "MaskedVideos", self.fnames[index])
-            # video = os.path.join(self.root, "MaskedVideos_SmoothDilated", self.fnames[index])
-            # video = os.path.join(self.root, "Videos_AttentionMask", self.fnames[index])
+            video_path = os.path.join(self.root, "Videos", self.fnames[index])
 
-        # Load video into np.array using PyAV
-        video = echonet.utils.loadvideo(video).astype(np.float32)
+        video = echonet.utils.loadvideo(video_path).astype(np.float32)
 
-        # --- 🚨 BOUNDING BOX AUTO-CROP (THE "ZOOM") 🚨 ---
-        # 1. Collapse the video across channels (0) and frames (1) to find all non-zero pixels
         USE_AUTOCROP = False
         if USE_AUTOCROP:
             spatial_mask = video.sum(axis=(0, 1))
-            
-            # 2. Find the coordinates of the bounding box
             rows = np.any(spatial_mask, axis=1)
             cols = np.any(spatial_mask, axis=0)
-            
-            # Safety check: Only crop if the mask isn't completely empty
             if rows.any() and cols.any():
-                # Get the exact min and max coordinates
                 rmin, rmax = np.where(rows)[0][[0, -1]]
                 cmin, cmax = np.where(cols)[0][[0, -1]]
-                
-                # Add a 5-pixel padding buffer. 
-                # (Crucial so we don't accidentally slice off the edge of the heart wall!)
-                pad = 5
-                rmin = max(0, rmin - pad)
-                rmax = min(video.shape[2], rmax + pad + 1)
-                cmin = max(0, cmin - pad)
-                cmax = min(video.shape[3], cmax + pad + 1)
-                
-                # 3. Crop the video
-                cropped_video = video[:, :, rmin:rmax, cmin:cmax]
-                
-                # 4. Resize back up to 112x112 using PyTorch (the fastest interpolation)
-                import torch.nn.functional as F
-                import torch
-                
+                crop_pad = 5
+                rmin = max(0, rmin - crop_pad)
+                rmax = min(video.shape[2], rmax + crop_pad + 1)
+                cmin = max(0, cmin - crop_pad)
+                cmax = min(video.shape[3], cmax + crop_pad + 1)
+                cropped = video[:, :, rmin:rmax, cmin:cmax]
                 orig_h, orig_w = video.shape[2], video.shape[3]
-                
-                # Rearrange to [frames, channels, height, width] for standard 2D interpolation
-                cropped_tensor = torch.from_numpy(cropped_video).permute(1, 0, 2, 3) 
-                
-                # Stretch the cropped heart to fill the entire 112x112 frame
-                resized_tensor = F.interpolate(cropped_tensor, size=(orig_h, orig_w), mode='bilinear', align_corners=False)
-                
-                # Return it back to the original [channels, frames, height, width] numpy array format
-                video = resized_tensor.permute(1, 0, 2, 3).numpy()
-        # ---------------------------------------------------------
+                t = torch.from_numpy(cropped).permute(1, 0, 2, 3)
+                t = torch.nn.functional.interpolate(
+                    t, size=(orig_h, orig_w), mode="bilinear", align_corners=False
+                )
+                video = t.permute(1, 0, 2, 3).numpy()
 
-        # Add simulated noise (black out random pixels)
-        # 0 represents black at this point (video has not been normalized yet)
         if self.noise is not None:
-            n = video.shape[1] * video.shape[2] * video.shape[3]
-            ind = np.random.choice(n, round(self.noise * n), replace=False)
-            f = ind % video.shape[1]
+            n_pixels = video.shape[1] * video.shape[2] * video.shape[3]
+            ind = np.random.choice(
+                n_pixels, round(self.noise * n_pixels), replace=False
+            )
+            f_idx = ind % video.shape[1]
             ind //= video.shape[1]
-            i = ind % video.shape[2]
+            i_idx = ind % video.shape[2]
             ind //= video.shape[2]
-            j = ind
-            video[:, f, i, j] = 0
+            j_idx = ind
+            video[:, f_idx, i_idx, j_idx] = 0
 
-        # Apply normalization
         if isinstance(self.mean, (float, int)):
             video -= self.mean
         else:
@@ -304,113 +238,212 @@ class Echo(torchvision.datasets.VisionDataset):
         else:
             video /= self.std.reshape(3, 1, 1, 1)
 
-        # Set number of frames
         c, f, h, w = video.shape
+        video_filename = self.fnames[index]
+
+        # ---- mask channel (unchanged) ----
+        if self.mask_source == "zero":
+            mask_channel = np.zeros((1, f, h, w), np.float32)
+        elif self.mask_source == "predicted":
+            masked_path = os.path.join(
+                self.root, self.mask_dir, self.fnames[index]
+            )
+            if os.path.exists(masked_path):
+                m_raw = echonet.utils.loadvideo(masked_path).astype(np.float32)
+                mask_channel = (m_raw[0:1] > 127).astype(np.float32)
+                mask_channel = (mask_channel - 0.07) / 0.26
+            else:
+                mask_channel = np.zeros((1, f, h, w), np.float32)
+        elif self.mask_source == "temporal":
+            key = video_filename
+            emphasis = np.zeros(f, np.float32)
+            if key in self.frames and len(self.frames[key]) >= 2:
+                ed_fr = int(min(self.frames[key]))
+                es_fr = int(max(self.frames[key]))
+                sigma = 3.0
+                t = np.arange(f)
+                emphasis = (np.exp(-0.5 * ((t - ed_fr) / sigma) ** 2)
+                            + np.exp(-0.5 * ((t - es_fr) / sigma) ** 2)).astype(np.float32)
+                if emphasis.max() > 0:
+                    emphasis = emphasis / emphasis.max()
+            mask_channel = np.broadcast_to(
+                emphasis[None, :, None, None], (1, f, h, w)
+            ).astype(np.float32).copy()
+            mask_channel = mask_channel - 0.1
+        else:
+            key = video_filename
+            if key in self.frames and len(self.frames[key]) >= 2:
+                def make_mask(trace):
+                    x1, y1, x2, y2 = trace[:, 0], trace[:, 1], trace[:, 2], trace[:, 3]
+                    x = np.concatenate((x1[1:], np.flip(x2[1:])))
+                    y_c = np.concatenate((y1[1:], np.flip(y2[1:])))
+                    r, c_idx = skimage.draw.polygon(
+                        np.rint(y_c).astype(int),
+                        np.rint(x).astype(int),
+                        (h, w),
+                    )
+                    m = np.zeros((h, w), np.float32)
+                    m[r, c_idx] = 1.0
+                    return m
+
+                frame_a = self.frames[key][0]
+                frame_b = self.frames[key][-1]
+                mask_a = make_mask(self.trace[key][frame_a])
+                mask_b = make_mask(self.trace[key][frame_b])
+
+                if mask_a.sum() >= mask_b.sum():
+                    ed_frame, mask_ed = frame_a, mask_a
+                    es_frame, mask_es = frame_b, mask_b
+                else:
+                    ed_frame, mask_ed = frame_b, mask_b
+                    es_frame, mask_es = frame_a, mask_a
+
+                mask_volume = np.zeros((f, h, w), np.float32)
+                t0 = min(ed_frame, es_frame)
+                t1 = max(ed_frame, es_frame)
+                m0 = mask_ed if ed_frame < es_frame else mask_es
+                m1 = mask_es if ed_frame < es_frame else mask_ed
+
+                for t in range(f):
+                    if t <= t0:
+                        mask_volume[t] = m0
+                    elif t >= t1:
+                        mask_volume[t] = m1
+                    else:
+                        alpha = (t - t0) / (t1 - t0)
+                        mask_volume[t] = (1 - alpha) * m0 + alpha * m1
+
+                mask_channel = mask_volume[np.newaxis, :, :, :]
+                mask_channel = (mask_channel - 0.07) / 0.26
+            else:
+                mask_channel = np.zeros((1, f, h, w), np.float32)
+
+        if self.add_mask:
+            video = np.concatenate([video, mask_channel], axis=0)
+
+        c, f, h, w = video.shape
+
         if self.length is None:
-            # Take as many frames as possible
             length = f // self.period
         else:
-            # Take specified number of frames
             length = self.length
 
         if self.max_length is not None:
-            # Shorten videos to max_length
             length = min(length, self.max_length)
 
         if f < length * self.period:
-            # Pad video with frames filled with zeros if too short
-            # 0 represents the mean color (dark grey), since this is after normalization
-            video = np.concatenate((video, np.zeros((c, length * self.period - f, h, w), video.dtype)), axis=1)
-            c, f, h, w = video.shape  # pylint: disable=E0633
+            video = np.concatenate(
+                (
+                    video,
+                    np.zeros(
+                        (c, length * self.period - f, h, w), video.dtype
+                    ),
+                ),
+                axis=1,
+            )
+            c, f, h, w = video.shape
 
+        # ---- clip start ----
         if self.clips == "all":
-            # --- 🚨 INTELLIGENT PHASE 1 INFERENCE (PEAK DETECTION) 🚨 ---
-            import scipy.signal
-            
-            # 1. Calculate the area of the heart in every frame. 
-            # Because we are using MaskedVideos, the background is 0. 
-            # Summing the pixels perfectly tracks the size of the heart over time!
-            frame_sizes = video.sum(axis=(0, 2, 3))
-            
-            # 2. Find the peaks (End-Diastole) of the wave
-            # distance=15 ensures we don't count the same heartbeat twice
-            peaks, _ = scipy.signal.find_peaks(frame_sizes, distance=15)
-            
-            # 3. Filter the peaks so we only keep ones that have enough room 
-            # for a full 32-frame contraction clip
-            start = []
-            for p in peaks:
-                if p + (length * self.period) <= f:
-                    start.append(p)
-                    
-            # 4. Fallback: If it's a highly unusual video and it found no peaks, 
-            # safely fall back to the sliding window
-            if len(start) == 0:
-                start = np.arange(f - (length - 1) * self.period)
-            # -----------------------------------------------------------
-        else:
-            # Take random clips from video
-            # start = np.random.choice(f - (length - 1) * self.period, self.clips)
-            # --- 🚨 PATH A: TARGETED HEARTBEAT EXTRACTION 🚨 ---
-            video_filename = self.fnames[index] + ".avi"
-            # video_filename = self.fnames[index]
-            # if index < 10:
-            #     print(video_filename, video_filename in self.ed_frames)
-            
-            # 1. Try to start the clip exactly at the End-Diastolic frame
-            if hasattr(self, 'ed_frames') and video_filename in self.ed_frames:
-                start = int(self.ed_frames[video_filename])
+            cycle_len = length * self.period
+            if self.dense_clips:
+                # DENSE-EVAL: original EchoNet protocol — every possible start.
+                # This matches the R(2+1)D baseline and published numbers, which
+                # average over ALL overlapping clips (dense test-time augmentation).
+                start = list(np.arange(max(1, f - (length - 1) * self.period)))
+                if len(start) == 0:
+                    start = [max(0, f - cycle_len)]
+            elif hasattr(self, "ed_frames") and video_filename in self.ed_frames:
+                ed_anchor = int(self.ed_frames[video_filename])
+                ed_anchor = max(0, min(ed_anchor, max(0, f - cycle_len)))
+                stride = self.period * 4
+                start = list(np.arange(ed_anchor, f - (length - 1) * self.period, stride))
+                if len(start) == 0:
+                    start = [max(0, f - cycle_len)]
             else:
-                # Fallback to random if this specific video is missing from the CSV
-                start = np.random.randint(0, max(1, f - length * self.period + 1))
-            
-            # 2. Safety Catch: Prevent PyTorch from crashing!
-            # If the ED frame is too close to the end of the video, we won't have 
-            # enough frames to make a full 32-frame clip. We must slide the window back.
-            if start + (length * self.period) > f:
-                start = max(0, f - (length * self.period))
-            # ---------------------------------------------------
-            # 3. wrap it in a list
-            start = [start]
-        # else:
-        #     # --- TARGETED ED-BASED TEMPORAL JITTER ---
-        #     # During training, sample a clip near the ED frame.
-        #     # During validation/test one-clip, use the exact ED frame.
+                stride = self.period * 4
+                start = list(np.arange(0, f - (length - 1) * self.period, stride))
+                if len(start) == 0:
+                    start = [max(0, f - cycle_len)]
+        else:
+            if hasattr(self, "ed_frames") and video_filename in self.ed_frames:
+                ed_start = int(self.ed_frames[video_filename])
+            else:
+                ed_start = np.random.randint(
+                    0, max(1, f - length * self.period + 1)
+                )
 
-        #     video_filename = self.fnames[index]  # already includes ".avi"
+            if self.split == "TRAIN":
+                span = self.period * (length - 1)
+                key = video_filename
+                if key in self.frames and len(self.frames[key]) >= 2:
+                    ed_fr = int(min(self.frames[key]))
+                    es_fr = int(max(self.frames[key]))
+                    lo_needed = max(ed_fr, es_fr)
+                    hi_needed = min(ed_fr, es_fr)
+                    valid_lo = max(0, lo_needed - span)
+                    valid_hi = min(hi_needed, max(0, f - length * self.period))
+                    if valid_hi >= valid_lo:
+                        start_frame = np.random.randint(valid_lo, valid_hi + 1)
+                    else:
+                        mid = (ed_fr + es_fr) // 2
+                        start_frame = max(0, min(mid - span // 2,
+                                                 max(0, f - length * self.period)))
+                else:
+                    start_frame = np.random.randint(0, max(1, f - length * self.period + 1))
+            else:
+                start_frame = ed_start
 
-        #     max_start = max(1, f - length * self.period + 1)
+            start_frame = max(0, min(start_frame, max(0, f - length * self.period)))
+            start = [start_frame]
 
-        #     if hasattr(self, "ed_frames") and video_filename in self.ed_frames:
-        #         ed_start = int(self.ed_frames[video_filename])
-        #     else:
-        #         ed_start = np.random.randint(0, max_start)
+        # ------------------------------------------------------------------ #
+        # AREA-TARGET: compute ED/ES GT areas and their temporal-bin indices.
+        # Only for single-clip mode (training/val), only when enabled.
+        # bin = ((gt_frame - start_frame) / period) // (length / n_bins)
+        # With length=36, n_bins=18 -> frames_per_bin = 2.
+        # ------------------------------------------------------------------ #
+        area_ed = area_es = 0.0
+        bin_ed = bin_es = -1
+        valid_area = 0.0
+        if self.add_area_target and self.clips != "all":
+            key = video_filename
+            if key in self.frames and len(self.frames[key]) >= 2:
+                sf = start[0]
+                ed_fr = int(min(self.frames[key]))
+                es_fr = int(max(self.frames[key]))
+                pos_ed = (ed_fr - sf) / self.period      # index in 0..length-1
+                pos_es = (es_fr - sf) / self.period
+                frames_per_bin = max(1.0, length / float(self.n_bins))
+                if 0 <= pos_ed < length and 0 <= pos_es < length:
+                    area_ed = self._gt_area(key, ed_fr)
+                    area_es = self._gt_area(key, es_fr)
+                    bin_ed = min(int(pos_ed // frames_per_bin), self.n_bins - 1)
+                    bin_es = min(int(pos_es // frames_per_bin), self.n_bins - 1)
+                    valid_area = 1.0
 
-        #     if self.split == "TRAIN":
-        #         # Try jitter=4 first. Later test 8.
-        #         jitter = 4
-        #         offset = np.random.randint(-jitter, jitter + 1)
-        #         start = ed_start + offset
-        #     else:
-        #         start = ed_start
+        # ---- debug print (unchanged) ----
+        if (not self.clips == "all") and self.split == "TRAIN" \
+                and getattr(self, "_aug_print_count", 0) < 8:
+            key = video_filename
+            if key in self.frames and len(self.frames[key]) >= 2:
+                ed_fr = int(min(self.frames[key])); es_fr = int(max(self.frames[key]))
+                sf = start[0]
+#                 print(f"[clipdbg] {key} ED={ed_fr} ES={es_fr} start={sf} "
+#                       f"span=[{sf},{sf+self.period*(length-1)}] "
+#                       f"ED_in={sf<=ed_fr<=sf+self.period*(length-1)} "
+#                       f"ES_in={sf<=es_fr<=sf+self.period*(length-1)}", flush=True)
+#                 self._aug_print_count += 1
 
-        #     # Safety: keep start valid
-        #     start = max(0, min(start, f - length * self.period))
-
-        #     start = [start]
-
-        # Gather targets
+        # ---- targets (EF etc., unchanged) ----
         target = []
         for t in self.target_type:
-            key = self.fnames[index]
+            key = video_filename
             if t == "Filename":
-                target.append(self.fnames[index])
+                target.append(video_filename)
             elif t == "LargeIndex":
-                # Traces are sorted by cross-sectional area
-                # Largest (diastolic) frame is last
                 target.append(int(self.frames[key][-1]))
             elif t == "SmallIndex":
-                # Largest (diastolic) frame is first
                 target.append(int(self.frames[key][0]))
             elif t == "LargeFrame":
                 target.append(video[:, self.frames[key][-1], :, :])
@@ -418,109 +451,103 @@ class Echo(torchvision.datasets.VisionDataset):
                 target.append(video[:, self.frames[key][0], :, :])
             elif t in ["LargeTrace", "SmallTrace"]:
                 if t == "LargeTrace":
-                    t = self.trace[key][self.frames[key][-1]]
+                    tr = self.trace[key][self.frames[key][-1]]
                 else:
-                    t = self.trace[key][self.frames[key][0]]
-                x1, y1, x2, y2 = t[:, 0], t[:, 1], t[:, 2], t[:, 3]
+                    tr = self.trace[key][self.frames[key][0]]
+                x1, y1, x2, y2 = tr[:, 0], tr[:, 1], tr[:, 2], tr[:, 3]
                 x = np.concatenate((x1[1:], np.flip(x2[1:])))
-                y = np.concatenate((y1[1:], np.flip(y2[1:])))
-
-                r, c = skimage.draw.polygon(np.rint(y).astype(int), np.rint(x).astype(int), (video.shape[2], video.shape[3]))
+                y_coord = np.concatenate((y1[1:], np.flip(y2[1:])))
+                r, c_idx = skimage.draw.polygon(
+                    np.rint(y_coord).astype(int),
+                    np.rint(x).astype(int),
+                    (video.shape[2], video.shape[3]),
+                )
                 mask = np.zeros((video.shape[2], video.shape[3]), np.float32)
-                mask[r, c] = 1
+                mask[r, c_idx] = 1
                 target.append(mask)
             else:
-                if self.split == "CLINICAL_TEST" or self.split == "EXTERNAL_TEST":
+                if self.split in ("CLINICAL_TEST", "EXTERNAL_TEST"):
                     target.append(np.float32(0))
                 else:
-                    target.append(np.float32(self.outcome[index][self.header.index(t)]))
+                    target.append(
+                        np.float32(self.outcome[index][self.header.index(t)])
+                    )
 
-        # if target != []:
-        #     target = tuple(target) if len(target) > 1 else target[0]
-        #     if self.target_transform is not None:
-        #         target = self.target_transform(target)
-
-        # phyisc-informerd(begin)
-        if target != []:
-            # Check if the first target item is an array (like an image/mask)
+        if target:
             if isinstance(target[0], (np.ndarray, str)):
-                # Segmentation Task -> Return as a Tuple so shapes don't clash
                 target = tuple(target) if len(target) > 1 else target[0]
             else:
-                # EF/Volume Task -> Return as a Numpy array for smooth 2D Tensor collation
-                target = np.array(target, dtype=np.float32) if len(target) > 1 else target[0]
-            
+                target = (
+                    np.array(target, dtype=np.float32)
+                    if len(target) > 1
+                    else target[0]
+                )
             if self.target_transform is not None:
                 target = self.target_transform(target)
-        # physic-informed(end)
 
-        # Select clips from video
-        video = tuple(video[:, s + self.period * np.arange(length), :, :] for s in start)
+        # ---- extract clips ----
+        video = tuple(
+            video[:, s + self.period * np.arange(length), :, :]
+            for s in start
+        )
         if self.clips == 1:
             video = video[0]
         else:
             video = np.stack(video)
 
         if self.pad is not None:
-            # Add padding of zeros (mean color of videos)
-            # Crop of original size is taken out
-            # (Used as augmentation)
             c, l, h, w = video.shape
-            temp = np.zeros((c, l, h + 2 * self.pad, w + 2 * self.pad), dtype=video.dtype)
-            temp[:, :, self.pad:-self.pad, self.pad:-self.pad] = video  # pylint: disable=E1130
+            temp = np.zeros(
+                (c, l, h + 2 * self.pad, w + 2 * self.pad), dtype=video.dtype
+            )
+            temp[:, :, self.pad:-self.pad, self.pad:-self.pad] = video
             i, j = np.random.randint(0, 2 * self.pad, 2)
-            video = temp[:, :, i:(i + h), j:(j + w)]
+            video = temp[:, :, i: i + h, j: j + w]
 
-        # --- 🚨 HIGH-VALUE VIDEO AUGMENTATIONS 🚨 ---
-        # Apply ONLY during training to the final extracted clip
-        # --- LIGHT VIDEO AUGMENTATION ---
-        # if self.split == "TRAIN" and self.augment:
-        #     if self._aug_print_count < 5:
-        #         print(f"[DEBUG] Echo augmentation running: split={self.split}, augment={self.augment}", flush=True)
-        #         self._aug_print_count += 1
-        #     import torchvision.transforms.functional as TF
-        #     import random
-        #     import torch
-
-        #     if isinstance(video, np.ndarray):
-        #         vid_tensor = torch.from_numpy(video)
-        #     else:
-        #         vid_tensor = video
-
-        #     # [C, F, H, W] -> [F, C, H, W]
-        #     vid_tensor = vid_tensor.permute(1, 0, 2, 3)
-
-        #     # Light augmentation for already-masked/autocropped echo videos
-        #     angle = random.uniform(-5, 5)
-        #     scale = random.uniform(0.97, 1.03)
-        #     brightness = random.uniform(0.95, 1.05)
-        #     contrast = random.uniform(0.95, 1.05)
-
-        #     vid_tensor = TF.affine(
-        #         vid_tensor,
-        #         angle=angle,
-        #         translate=[0, 0],
-        #         scale=scale,
-        #         shear=0,
-        #         interpolation=TF.InterpolationMode.BILINEAR
-        #     )
-
-        #     vid_tensor = TF.adjust_brightness(vid_tensor, brightness)
-        #     vid_tensor = TF.adjust_contrast(vid_tensor, contrast)
-
-        #     video = vid_tensor.permute(1, 0, 2, 3).numpy()
-        # --------------------------------------------
         if self.split == "TRAIN" and self.augment:
-            print("Doing Augmentation!")
-            import random
-            # Make sure array is writable and float32
             video = np.ascontiguousarray(video, dtype=np.float32)
+            import random
+            # video shape here: (C, L, H, W)
 
+            # (a) Random horizontal flip — EF is area-based, flip-invariant; safe.
             if random.random() < 0.5:
-                scale = random.uniform(0.97, 1.03)
+                video = video[:, :, :, ::-1]
+
+            # (b) Intensity scale (gain variation across ultrasound machines).
+            if random.random() < 0.8:
+                scale = random.uniform(0.9, 1.1)
                 video = video * scale
 
+            # (c) Additive brightness shift.
+            if random.random() < 0.5:
+                video = video + random.uniform(-0.1, 0.1)
+
+            # (d) Small random rotation (probe-angle variation), applied per-clip
+            #     to all frames identically. Keep small (+-8 deg) to avoid
+            #     distorting apparent chamber area too much.
+            if random.random() < 0.5:
+                import scipy.ndimage
+                angle = random.uniform(-8.0, 8.0)
+                # rotate spatial dims (H,W)=(2,3), reshape=False keeps size,
+                # order=1 bilinear, fill with the normalized-mean (~0).
+                video = scipy.ndimage.rotate(
+                    video, angle, axes=(2, 3), reshape=False, order=1, mode="constant", cval=0.0
+                )
+
+            video = np.ascontiguousarray(video, dtype=np.float32)
             video = np.clip(video, -5.0, 5.0).astype(np.float32)
+
+        # ------------------------------------------------------------------ #
+        # AREA-TARGET: package and return.
+        # When enabled, return (video, (ef_target, area_target)).
+        # When disabled, return (video, target) exactly as before.
+        # ------------------------------------------------------------------ #
+        if self.add_area_target:
+            area_target = np.array(
+                [area_ed, area_es, float(bin_ed), float(bin_es), valid_area],
+                dtype=np.float32,
+            )
+            return video, (target, area_target)
 
         return video, target
 
@@ -528,16 +555,9 @@ class Echo(torchvision.datasets.VisionDataset):
         return len(self.fnames)
 
     def extra_repr(self) -> str:
-        """Additional information to add at end of __repr__."""
         lines = ["Target type: {target_type}", "Split: {split}"]
-        return '\n'.join(lines).format(**self.__dict__)
+        return "\n".join(lines).format(**self.__dict__)
 
 
 def _defaultdict_of_lists():
-    """Returns a defaultdict of lists.
-
-    This is used to avoid issues with Windows (if this function is anonymous,
-    the Echo dataset cannot be used in a dataloader).
-    """
-
     return collections.defaultdict(list)

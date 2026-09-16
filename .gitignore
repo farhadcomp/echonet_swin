@@ -1,18 +1,32 @@
-.ipynb_checkpoints/
-*.swp
-echonet.cfg
-.echonet.cfg
-*.pyc
-echonet.egg-info/
-
-# Ignore Logs and Checkpoints
-output/
+# environments
+echo_env*/
+*_blackwell/
+venv/
 __pycache__/
-slurm_output_*.txt
-slurm_error_*.txt
-nohup_master_log.txt
-*.csv
+*.pyc
 
-# Ignore any tensors or model weights saved here
+# data & model weights (RUA: never commit EchoNet data)
+*.avi
 *.pt
 *.pth
+output/
+MaskedVideos*/
+Videos/
+*.csv
+
+# slurm & logs
+slurm_*.err
+slurm_*.out
+logs/
+*.log
+
+# working copies / backups
+*copy*.py
+*backup*.py
+echonet/datasets/echo_*.py
+
+# generated figures (regenerated from scripts)
+*.pdf
+*.png
+*.egg-info/
+echonet.cfg
