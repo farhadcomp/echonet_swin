@@ -30,3 +30,5 @@ echonet/datasets/echo_*.py
 *.png
 *.egg-info/
 echonet.cfg
+*.sh
+requirements_old*.txt
