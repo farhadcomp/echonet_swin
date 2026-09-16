@@ -1,97 +1,95 @@
-EchoNet-Dynamic:<br/>Interpretable AI for beat-to-beat cardiac function assessment
-------------------------------------------------------------------------------
+# The Segmentation Ceiling: Echocardiographic Ejection-Fraction Regression
 
-EchoNet-Dynamic is a end-to-end beat-to-beat deep learning model for
-  1) semantic segmentation of the left ventricle
-  2) prediction of ejection fraction by entire video or subsampled clips, and
-  3) assessment of cardiomyopathy with reduced ejection fraction.
+Code for the paper *"The segmentation ceiling: why explicit left-ventricular masks
+do not improve learned ejection-fraction regression."*
 
-For more details, see the accompanying paper,
+The repository contains the analysis, training, and figure-generation scripts used
+in the paper. It is built on the [EchoNet-Dynamic](https://echonet.github.io/dynamic/)
+dataset and a UniFormer-S video backbone.
 
-> [**Video-based AI for beat-to-beat assessment of cardiac function**](https://www.nature.com/articles/s41586-020-2145-8)<br/>
-  David Ouyang, Bryan He, Amirata Ghorbani, Neal Yuan, Joseph Ebinger, Curt P. Langlotz, Paul A. Heidenreich, Robert A. Harrington, David H. Liang, Euan A. Ashley, and James Y. Zou. <b>Nature</b>, March 25, 2020. https://doi.org/10.1038/s41586-020-2145-8
+## Data
 
-Dataset
--------
-We share a deidentified set of 10,030 echocardiogram images which were used for training EchoNet-Dynamic.
-Preprocessing of these images, including deidentification and conversion from DICOM format to AVI format videos, were performed with OpenCV and pydicom. Additional information is at https://echonet.github.io/dynamic/. These deidentified images are shared with a non-commerical data use agreement.
+Experiments use the publicly available **EchoNet-Dynamic** dataset, released under a
+Stanford Research Use Agreement (<https://echonet.github.io/dynamic/>). The dataset
+is **not** redistributed here; download it separately and point the scripts at your
+local copy with `--data_dir`. Model checkpoints and generated data are likewise not
+included.
 
-Examples
---------
+## Environment
 
-We show examples of our semantic segmentation for nine distinct patients below.
-Three patients have normal cardiac function, three have low ejection fractions, and three have arrhythmia.
-No human tracings for these patients were used by EchoNet-Dynamic.
+```bash
+pip install -r requirements.txt
+```
 
-| Normal                                 | Low Ejection Fraction                  | Arrhythmia                             |
-| ------                                 | ---------------------                  | ----------                             |
-| ![](docs/media/0X10A28877E97DF540.gif) | ![](docs/media/0X129133A90A61A59D.gif) | ![](docs/media/0X132C1E8DBB715D1D.gif) |
-| ![](docs/media/0X1167650B8BEFF863.gif) | ![](docs/media/0X13CE2039E2D706A.gif ) | ![](docs/media/0X18BA5512BE5D6FFA.gif) |
-| ![](docs/media/0X148FFCBF4D0C398F.gif) | ![](docs/media/0X16FC9AA0AD5D8136.gif) | ![](docs/media/0X1E12EEE43FD913E5.gif) |
+Key dependencies: PyTorch, torchvision, numpy, pandas, scikit-learn, opencv-python,
+matplotlib, tqdm.
 
-Installation
-------------
+## Repository contents
 
-First, clone this repository and enter the directory by running:
+### Segmentation-ceiling analysis
+- `measure_rho.py` — measures the within-patient ED/ES area-error correlation (rho)
+  of the DeepLabV3 segmenter and reports the break-even area-error threshold.
+- `make_ceiling_figure.py` — renders the closed-form segmentation-ceiling figure
+  from the derived criterion and the measured rho.
 
-    git clone https://github.com/echonet/dynamic.git
-    cd dynamic
+### Training
+- `echonet/utils/video_uniformer.py` — UniFormer-S EF regression training/eval.
+- `echonet/utils/video_uniformer_area.py` — area-consistency auxiliary-task variants
+  (per-bin and amplitude consistency).
+- `echonet/utils/video_uniformer_nll.py` — heteroscedastic beta-NLL variant that
+  predicts EF and its variance for per-prediction uncertainty.
+- `models/uniformer.py` — UniFormer-S backbone with GroupNorm and 4-channel input.
 
-EchoNet-Dynamic is implemented for Python 3, and depends on the following packages:
-  - NumPy
-  - PyTorch
-  - Torchvision
-  - OpenCV
-  - skimage
-  - sklearn
-  - tqdm
+### Segmentation masks
+- `generate_masks_deeplabv3.py` — generates DeepLabV3 predicted LV masks used for the
+  predicted-mask input channel.
 
-Echonet-Dynamic and its dependencies can be installed by navigating to the cloned directory and running
+### Uncertainty and figures
+- `mc_dropout_recalib.py` — Monte-Carlo dropout uncertainty with variance recalibration.
+- `bland_altman_from_clips.py` — Bland-Altman agreement plot from per-clip predictions.
 
-    pip install --user .
+## Reproducing the key results
 
-Usage
------
-### Preprocessing DICOM Videos
+Measure the segmentation-ceiling parameters (rho and the break-even threshold):
 
-The input of EchoNet-Dynamic is an apical-4-chamber view echocardiogram video of any length. The easiest way to run our code is to use videos from our dataset, but we also provide a Jupyter Notebook, `ConvertDICOMToAVI.ipynb`, to convert DICOM files to AVI files used for input to EchoNet-Dynamic. The Notebook deidentifies the video by cropping out information outside of the ultrasound sector, resizes the input video, and saves the video in AVI format. 
+```bash
+python3 measure_rho.py \
+    --data_dir /path/to/EchoNet-Dynamic \
+    --weights  /path/to/deeplabv3_resnet50.pt \
+    --split test
+```
 
-### Setting Path to Data
+Render the ceiling figure:
 
-By default, EchoNet-Dynamic assumes that a copy of the data is saved in a folder named `a4c-video-dir/` in this directory.
-This path can be changed by creating a configuration file named `echonet.cfg` (an example configuration file is `example.cfg`).
+```bash
+python3 make_ceiling_figure.py
+```
 
-### Running Code
+Train the main EF regressor (EMA + augmentation):
 
-EchoNet-Dynamic has three main components: segmenting the left ventricle, predicting ejection fraction from subsampled clips, and assessing cardiomyopathy with beat-by-beat predictions.
-Each of these components can be run with reasonable choices of hyperparameters with the scripts below.
-We describe our full hyperparameter sweep in the next section.
+```bash
+python3 -m echonet.utils.video_uniformer \
+    --data_dir /path/to/EchoNet-Dynamic \
+    --output output/uniformer_ema_aug \
+    --uniformer_weights /path/to/uniformer_small_k400_16x8.pth \
+    --mask_source zero --augment --run_test
+```
 
-#### Frame-by-frame Semantic Segmentation of the Left Ventricle
+Train the heteroscedastic beta-NLL uncertainty variant:
 
-    echonet segmentation --save_video
+```bash
+python3 -m echonet.utils.video_uniformer_nll \
+    --data_dir /path/to/EchoNet-Dynamic \
+    --output output/uniformer_nll \
+    --uniformer_weights /path/to/uniformer_small_k400_16x8.pth \
+    --mask_source zero --augment --beta 0.5 --run_test
+```
 
-This creates a directory named `output/segmentation/deeplabv3_resnet50_random/`, which will contain
-  - log.csv: training and validation losses
-  - best.pt: checkpoint of weights for the model with the lowest validation loss
-  - size.csv: estimated size of left ventricle for each frame and indicator for beginning of beat
-  - videos: directory containing videos with segmentation overlay
+## Citation
 
-#### Prediction of Ejection Fraction from Subsampled Clips
+If you use this code, please cite the paper (citation to be added upon publication).
 
-  echonet video
+## License
 
-This creates a directory named `output/video/r2plus1d_18_32_2_pretrained/`, which will contain
-  - log.csv: training and validation losses
-  - best.pt: checkpoint of weights for the model with the lowest validation loss
-  - test_predictions.csv: ejection fraction prediction for subsampled clips
-
-#### Beat-by-beat Prediction of Ejection Fraction from Full Video and Assesment of Cardiomyopathy
-
-The final beat-by-beat prediction and analysis is performed with `scripts/beat_analysis.R`.
-This script combines the results from segmentation output in `size.csv` and the clip-level ejection fraction prediction in `test_predictions.csv`. The beginning of each systolic phase is detected by using the peak detection algorithm from scipy (`scipy.signal.find_peaks`) and a video clip centered around the beat is used for beat-by-beat prediction.
-
-### Hyperparameter Sweeps
-
-The full set of hyperparameter sweeps from the paper can be run via `run_experiments.sh`.
-In particular, we choose between pretrained and random initialization for the weights, the model (selected from `r2plus1d_18`, `r3d_18`, and `mc3_18`), the length of the video (1, 4, 8, 16, 32, 64, and 96 frames), and the sampling period (1, 2, 4, 6, and 8 frames).
+Code released for research use. The EchoNet-Dynamic dataset is governed by its own
+Stanford Research Use Agreement and is not included in this repository.
